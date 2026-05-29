@@ -69,8 +69,9 @@ services:
     depends_on:
       - control
     environment:
-      # web talks to control; in the browser this resolves to localhost:8000.
-      VITE_CONTROL_BASE_URL: "http://localhost:8000"
+      # The browser calls same-origin /v1/...; the vite dev server proxies those
+      # to the control service on the compose network.
+      CONTROL_PROXY_TARGET: "http://control:8000"
     ports:
       - "5173:5173"
     networks: [bench]

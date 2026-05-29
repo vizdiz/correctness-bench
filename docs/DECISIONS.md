@@ -92,5 +92,25 @@ confirm the hypertable path; expected to pass unchanged.
 
 ## Web (Phase 4) — see entries added during that phase below
 
-### [D10] Font + palette
-(Recorded at implementation time if Phase 4 is reached.)
+### [D10] Font + palette + CSS framework
+- **Tailwind v4** via `@tailwindcss/vite` (CSS-first `@theme` tokens, no
+  tailwind.config / postcss). Modern path for a fresh Vite 8 + React 19 scaffold.
+- **Fonts:** Inter (UI) + JetBrains Mono (all numbers / IDs), bundled via
+  `@fontsource/*` so there is NO runtime CDN dependency (works offline / in the
+  container). Numbers use tabular figures so columns don't jitter.
+- **Palette:** dark "instrument panel" in the spirit of Linear/Stripe — layered
+  near-black surfaces (#08090c → #0e1014 → #14171d), hairline borders, one vivid
+  indigo accent (#6c8cff). Semantic colors carry meaning for the headline chart:
+  correctness = green (#34d399), latency = the indigo accent, failures/abort =
+  red (#f87171).
+**Review:** all design choices are easy to override — tokens live in one place
+(`web/src/index.css` `@theme`). If you prefer a light theme or different accent,
+change the tokens; components read them. NOTE: the UI was NOT visually verified in
+a browser this session (no display/browser available) — only type-checked, built,
+and its API wiring exercised. Eyeball it before relying on the look.
+
+### [D13] Web ↔ control wiring via vite dev proxy (not CORS)
+The browser calls same-origin `/v1/...`; the vite dev server proxies to control
+(`CONTROL_PROXY_TARGET`, default localhost:8000; `http://control:8000` in compose).
+Avoids adding CORS to the control plane for v1. **Review:** for a production web
+build (not dev server) you'll need either a reverse proxy or CORS on control.

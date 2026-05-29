@@ -162,4 +162,36 @@ Dockerfile + .dockerignore written (golang:1.26 -> debian-slim + curl
 healthcheck). Added AUTO_MIGRATE env toggle (D11). NOT docker-build-verified
 (no Docker).
 
+## 2026-05-29T16:10Z — Phase 4: web skeleton DONE (structural)
+
+Vite 8 + React 19 + TypeScript 6 + Tailwind v4. Design system (D10): Inter +
+JetBrains Mono (bundled, no CDN), dark Linear/Stripe-inspired tokens via @theme,
+semantic colors (correctness=green, latency=indigo, failures=red).
+
+Component library: Button, Card (+Header/Body), Input/Select/Field,
+NumberDisplay, Sparkline (placeholder), StatusBadge, Layout (sidebar shell).
+Pages: /runs (list, real data), /runs/new (form per POST /v1/runs, API key as a
+password field), /runs/:id (metric strip + chart placeholder + abort). API client
+in src/lib/api.ts (typed to api.md). Numbers rounded via src/lib/format.ts.
+
+`npm run build` (tsc -b + vite build) — PASS, no type errors:
+```
+✓ built in 176ms   dist/assets/index-*.js 246.91 kB (gzip 78.57 kB)   fonts bundled
+```
+
+Live dev-chain verification (web dev server -> vite proxy -> control -> PG16):
+```
+GET  http://localhost:5173/            -> serves app (<title>correctness-bench</title>)
+GET  http://localhost:5173/healthz     -> {"status":"ok"}        (proxied to control)
+GET  http://localhost:5173/v1/runs     -> {"runs":[...]}          (proxied)
+POST http://localhost:5173/v1/runs     -> 201 {"run_id":"e2f3deb1-...","status":"queued"}
+canary in DB after web-path create     -> 0 ; stored headers = {"Authorization":"***"}
+```
+
+LIMITATION: the React UI was NOT visually rendered/verified — no browser or
+display in this environment. Type-check, production build, and the full API/proxy
+wiring are verified; the visual design is unconfirmed (D10). Dockerfile.dev +
+.dockerignore written, compose `web` env switched to CONTROL_PROXY_TARGET. NOT
+docker-build-verified (no Docker).
+
 <!-- Subsequent phases append below this line. -->

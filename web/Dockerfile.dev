@@ -1,0 +1,15 @@
+# Dev-mode container for the web app (vite dev server with HMR).
+# NOTE: authored without a Docker runtime — NOT yet docker-build-verified.
+# The app is verified natively (npm run build type-checks + a live dev server
+# proxying to the control plane; see docs/BUILD_LOG.md).
+
+FROM node:24-slim
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install
+COPY . .
+EXPOSE 5173
+# CONTROL_PROXY_TARGET points the dev proxy at the control service on the compose
+# network; --host makes vite listen on 0.0.0.0 so the published port works.
+ENV CONTROL_PROXY_TARGET=http://control:8000
+CMD ["npm", "run", "dev", "--", "--host"]
