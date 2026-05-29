@@ -1,0 +1,28 @@
+[package]
+name = "mock"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Mock target with load-dependent failure injection. The test bench every gate
+# validates against (see .claude/agents/mock.md). lib + thin bin so integration
+# tests can spawn the real app on an ephemeral port.
+
+[lib]
+name = "mock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mock"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

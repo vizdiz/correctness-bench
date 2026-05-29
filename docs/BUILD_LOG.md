@@ -44,4 +44,53 @@ libpg_query parser compiled to wasm (DECISIONS D3), not a naive scan.
 - `go mod init github.com/vizdiz/correctness-bench/control` → go.mod ok.
 - `npm create vite@latest web -- --template react-ts` → scaffolded ok.
 
+## 2026-05-29T04:45Z — Phase 2: mock service (Rust + axum) DONE
+
+Implemented `mock/` as lib + thin bin. Five modes, rolling-1s RPS meter, knobs
+`mode`/`cliff_rps`/`pct`/`base_latency_ms`. Determinism via a per-instance
+request counter (`seq % 100 < pct`), so cliff/injection reproduce.
+
+`cargo test` — ALL GREEN (6 unit + 7 integration):
+
+```
+running 6 tests (unit: meter + decide)
+test tests::meter_counts_within_one_second_window ... ok
+test tests::meter_drops_old_slots ... ok
+test tests::below_cliff_always_healthy_even_in_injection_mode ... ok
+test tests::above_cliff_injects_per_mode ... ok
+test tests::healthy_mode_never_injects_above_cliff ... ok
+test tests::pct_selects_a_fraction_above_cliff ... ok
+test result: ok. 6 passed; 0 failed
+
+running 7 tests (integration: spawn server + reqwest)
+test healthz_ok ... ok
+test healthy_is_ok_below_and_above_cliff ... ok
+test fast500_healthy_below_500_above ... ok
+test truncate_returns_invalid_json_above_cliff ... ok
+test wrong_value_is_schema_valid_but_wrong_above_cliff ... ok
+test slow_ok_is_slow_but_correct_above_cliff ... ok
+test pct_50_injects_half_above_cliff ... ok
+test result: ok. 7 passed; 0 failed
+```
+
+Native curl proof (server on 127.0.0.1:8089) — stands in for the container check
+since no Docker runtime is available (DECISIONS D2):
+
+```
+healthz                                    -> 200 "ok"
+healthy base_latency_ms=20                 -> 200 {"status":"ok","count":3,...}  x-mock-injected: false
+fast500 cliff_rps=1000000 (below)          -> 200 healthy            x-mock-injected: false
+fast500 cliff_rps=0 pct=100 (above)        -> 500 {"status":"error","code":500}  x-mock-injected: true
+truncate cliff_rps=0 pct=100 (above)       -> 200 {"status":"ok","count":3,"items":["a","b   (invalid json)
+wrong_value cliff_rps=0 pct=100 (above)    -> 200 {"status":"ok","count":-1,...}
+slow_ok cliff_rps=0 pct=100 (above)        -> 200 healthy body, time_total=0.502s
+healthy base=0  timing                     -> 200 time_total=0.000761s   (internal <1ms: PASS)
+healthy base=20 timing                     -> 200 time_total=0.022934s
+mode=bogus                                 -> 400 (bad mode rejected)
+```
+
+Dockerfile + .dockerignore written (multi-stage rust:1-slim -> debian-slim +
+curl healthcheck). NOT `docker build`-verified (no Docker). Compose `mock`
+service on fixed port 8080; healthcheck aligned to curl.
+
 <!-- Subsequent phases append below this line. -->
