@@ -93,4 +93,73 @@ Dockerfile + .dockerignore written (multi-stage rust:1-slim -> debian-slim +
 curl healthcheck). NOT `docker build`-verified (no Docker). Compose `mock`
 service on fixed port 8080; healthcheck aligned to curl.
 
+## 2026-05-29T05:00Z — note: commit co-author trailer removed
+
+User instruction (mid-session): never add Claude as a git co-author. Rewrote the
+two existing commits to strip the `Co-Authored-By: Claude` trailer and
+force-pushed (brand-new private solo repo; --force-with-lease). Verified zero
+trailers reachable locally or on the remote. All future commits omit it. Saved as
+a durable preference in memory.
+
+## 2026-05-29T16:01Z — Phase 3: control plane plumbing (Go) DONE (structural)
+
+Go module `control/`: chi router (D8), pgx/pgxpool, goose migrations (D9,
+embedded), slog JSON to stdout. Layout: cmd/control, internal/{api,store,config,
+migrations,sse}. SSE/compare/regression/templates/histogram intentionally NOT
+built (depend on engine / out of scope).
+
+Endpoints implemented + tested: POST /v1/runs (validate + cost ceiling + cred
+scrub + insert queued), GET /v1/runs/:id (headers stripped), GET /v1/runs
+(keyset cursor pagination), POST /v1/runs/:id/abort (state transition; 409 on
+terminal). Plus GET /healthz.
+
+Verified against a **real Postgres 16** (temporary cluster on :5433; Timescale
+not installed, so the 3 timescale statements are shimmed out for tests — D12).
+
+`go vet ./...` clean. `go test ./... -count=1` ALL GREEN:
+```
+ok  internal/api          2.079s   (canary + 5 handler/CRUD tests + scrub + validate)
+ok  internal/migrations   3.836s   (drift guard: migration == frozen schema.sql)
+```
+
+CREDENTIAL CANARY (hard gate) — PASSES, 0 hits:
+```
+=== RUN   TestCredentialCanary
+    canary_test.go:101: canary clean: 0 hits across POST/GET responses, full DB dump, and logs
+--- PASS: TestCredentialCanary (0.01s)
+```
+The canary (CANARY_DO_NOT_LEAK_xyz123) was injected into Authorization, X-Api-Key,
+and a custom header; the test greps every runs row via row_to_json(runs)::text,
+both API responses, and the captured logs. Zero occurrences. Stored
+target_headers_redacted contains the '***' placeholder (proves scrubbing happened,
+not just absence).
+
+Schema application proof (frozen schema on real PG16, timescale shimmed):
+```
+$ \dt  ->  comparisons, offload_eval, run_ticks, runs, templates, worker_telemetry  (6 tables)
+runs: id uuid PK default gen_random_uuid(), target_headers_redacted jsonb NOT NULL, ... (matches contract)
+```
+
+goose Up against plain PG (no Timescale) fails ONLY at the first statement
+`CREATE EXTENSION timescaledb` (SQLSTATE 0A000 "extension not available"); every
+DDL statement is otherwise valid. On a Timescale-enabled Postgres (the user's
+docker-compose) goose Up will complete. Migration file is goose-correct and
+matches the frozen contract (drift test green).
+
+Live server end-to-end (real binary, real PG, AUTO_MIGRATE=false against the
+pre-applied schema), via curl:
+```
+GET  /healthz                 -> 200 {"status":"ok"}
+POST /v1/runs (canary header) -> 201 {"run_id":"426709f4-...","status":"queued"}
+GET  /v1/runs/:id             -> 200 {...,"target":{"url":...,"method":"POST"}}  (NO headers, NO canary)
+GET  /v1/runs?limit=5         -> 200 {"runs":[...],"next_cursor":...}
+POST /v1/runs/:id/abort       -> 200 {"status":"aborted","aborted_at":...}
+POST .../abort (again)        -> 409
+SELECT ... LIKE '%CANARY%'    -> 0   (live path, not just unit test)
+```
+
+Dockerfile + .dockerignore written (golang:1.26 -> debian-slim + curl
+healthcheck). Added AUTO_MIGRATE env toggle (D11). NOT docker-build-verified
+(no Docker).
+
 <!-- Subsequent phases append below this line. -->

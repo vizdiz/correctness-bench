@@ -65,8 +65,28 @@ coordinator structure pre-created. **Review:** engine agent owns this tomorrow.
 params + middleware ergonomics while staying net/http-compatible and tiny.)
 
 ### [D9] Migration tool: goose
-(Recorded at implementation time — goose over atlas: simpler, single binary, plain
-SQL migrations that can wrap the frozen schema.sql verbatim without a DSL.)
+goose over atlas: simpler, single binary, plain SQL migrations that wrap the
+frozen schema.sql verbatim without a DSL. The migration is embedded (go:embed) and
+run programmatically on startup via the pgx stdlib driver. A drift test asserts the
+migration matches contracts/schema.sql byte-for-byte (modulo comments/whitespace).
+
+### [D11] `AUTO_MIGRATE` env toggle (default true)
+control runs goose on startup by default (convenient for docker-compose), but
+`AUTO_MIGRATE=false` skips it for when migrations run as a separate deploy step or
+the schema is pre-applied. **Why added:** lets the server boot against an
+already-migrated DB; used it to verify the live server against plain Postgres
+(goose's verbatim schema needs Timescale, which wasn't installed). **Review:**
+keep, or always run migrations as a separate job and default this false.
+
+### [D12] Test-only Timescale shim (no contract/migration fork)
+DB tests run against plain Postgres 16 (no Timescale installed — see D2). The test
+harness applies the frozen schema with the 3 timescaledb-specific statements
+skipped (extension + 2 `create_hypertable` calls), so hypertables become plain
+tables. This does NOT touch the frozen contract or the migration, and does NOT
+weaken the canary gate: the credential path only writes `runs`, which is identical
+either way. The shim asserts each skipped statement still exists verbatim (drift
+guard). **Review:** re-run the full suite against Timescale once Docker is up to
+confirm the hypertable path; expected to pass unchanged.
 
 ---
 
