@@ -15,8 +15,8 @@ Legend: `[x]` done · `[~]` in progress · `[ ]` not started · `[S]` supervised
 |---|------|-------|-------------|-----|
 | 0.1 [x] | Monorepo scaffold, contracts in place, validators green | orchestrator | all 4 kit validators pass | repo builds, validators pass, pushed |
 | 0.2 [x] | Mock service, 5 modes, tests, dockerized | mock | `cargo test` green + curl per mode | see Track 1 |
-| 0.3 [~] | Control plane plumbing (4 endpoints + canary) | control | canary test = 0 hits, handler tests green | see Track 2 |
-| 0.4 [ ] | Web skeleton + design system | web | pages render, run-create wired | see Track 3 |
+| 0.3 [x] | Control plane plumbing (4 endpoints + canary) | control | canary test = 0 hits, handler tests green | see Track 2 |
+| 0.4 [x] | Web skeleton + design system | web | build passes, run-create wired (UI not visually verified) | see Track 3 |
 
 ---
 
