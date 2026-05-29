@@ -1,0 +1,12 @@
+[package]
+name = "bench-cli"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Thin client of the control plane. NOT a load generator of its own.
+# Built LATE (see .claude/agents/cli.md). Stub only during scaffolding.
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"

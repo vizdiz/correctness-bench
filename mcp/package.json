@@ -1,0 +1,15 @@
+{
+  "name": "@correctness-bench/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MCP server exposing the benchmarker as agent-callable tools. Thin client of contracts/api.md. Built LAST (stub only).",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}

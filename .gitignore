@@ -1,0 +1,47 @@
+# ---- Rust (engine/, mock/, cli/) ----
+target/
+**/target/
+# Cargo.lock IS committed (these are applications, not libraries — reproducible builds)
+*.rs.bk
+*.pdb
+
+# ---- Go (control/) ----
+control/bin/
+*.test
+*.out
+go.work
+go.work.sum
+
+# ---- Node / TS (web/, mcp/) ----
+node_modules/
+**/node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+.npm/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- Env / secrets (NEVER commit target API keys) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ---- Editor / OS ----
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
+
+# ---- Build / validation scratch ----
+/tmp/
+*.descriptor
+pgdata/

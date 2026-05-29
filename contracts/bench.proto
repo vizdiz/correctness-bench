@@ -1,0 +1,260 @@
+syntax = "proto3";
+package bench;
+
+// FROZEN CONTRACT — worker <-> coordinator. Do not edit without human sign-off.
+// Versioned. Bump CONTRACT_VERSION when shape changes; coordinator + worker check on handshake.
+//
+// CONTRACT_VERSION = "1.0.0"  (carried on the wire in WorkerInfo.contract_version
+// and Assignment.contract_version; handshake fails on mismatch.)
+
+// ============================================================
+// SERVICE
+// ============================================================
+
+service Bench {
+  // Worker → Coordinator on startup. Coordinator maintains an in-memory
+  // {worker_id → address} map. No external service discovery (Consul/etcd/k8s).
+  rpc Register(WorkerInfo) returns (RegisterAck);
+
+  // Coordinator hands a slice to a worker, worker streams partials back, then a final summary.
+  // Stream terminates with either:
+  //   - one Partial with `final = true`, or
+  //   - a gRPC error status (transport-level failure).
+  rpc RunSlice(Assignment) returns (stream WorkerEvent);
+
+  // Worker heartbeat — used for death detection so the coordinator can redistribute/respawn.
+  // Worker pushes every 1s independently of RunSlice. If 3 consecutive miss → considered dead.
+  rpc Heartbeat(stream WorkerHealth) returns (stream HealthAck);
+
+  // Out-of-band abort. Coordinator calls this to stop a worker mid-run (<1s requirement).
+  // Worker drains in-flight responses, sends a final Partial(final=true) on its RunSlice stream, exits.
+  rpc Abort(AbortRequest) returns (AbortAck);
+}
+
+// ============================================================
+// REGISTRATION (worker startup)
+// ============================================================
+
+message WorkerInfo {
+  string worker_id  = 1;     // worker-generated UUID, stable for the worker's lifetime
+  string address    = 2;     // host:port the coordinator can dial back on
+  string contract_version = 3;
+  uint32 max_rps    = 4;     // worker's self-declared ceiling (optional, hint)
+}
+
+message RegisterAck {
+  bool accepted = 1;
+  string reason = 2;         // populated if accepted=false (e.g. version mismatch)
+}
+
+// ============================================================
+// ASSIGNMENT (down)
+// ============================================================
+
+message Assignment {
+  string run_id        = 1;
+  string worker_id     = 2;
+  string contract_version = 3;   // must match server's; mismatch → fail handshake
+
+  // Target
+  Target target        = 4;
+
+  // Load shape
+  double throughput    = 5;       // RPS for THIS worker's slice (open-loop) or N conns (closed-loop)
+  double catch_up      = 6;       // = throughput * 2.0, matched to wrk2
+  LoadModel load_model = 7;
+  int32  connections   = 8;       // pool size for open-loop; N virtual users for closed-loop
+  bool   keepalive     = 9;
+  int64  epoch_unix_us = 10;      // SHARED start time across the fleet (coordinator-provided)
+  int32  duration_s    = 11;
+  int32  warmup_s      = 12;      // recorded separately, never folded into the main histogram
+
+  // Assertions (inline tier; expensive tier configured via sample_every_n + ship_bodies)
+  AssertSpec assert    = 13;
+
+  // Rate-limit handling — what to do when the target says "slow down"
+  RateLimitPolicy rate_limit_policy = 14;
+}
+
+message Target {
+  string url           = 1;
+  HttpMethod method    = 2;
+  map<string,string> headers = 3;  // includes auth; NEVER persisted by anyone
+  bytes  body          = 4;        // request body (for POST/PUT/PATCH)
+  int32  timeout_ms    = 5;
+  bool   verify_tls    = 6;
+}
+
+enum HttpMethod { GET = 0; POST = 1; PUT = 2; PATCH = 3; DELETE = 4; HEAD = 5; }
+
+enum LoadModel { OPEN = 0; CLOSED = 1; }
+
+message AssertSpec {
+  // Inline tier (worker, ~0 cost)
+  optional int64  max_latency_us = 1;
+  optional int32  min_body_bytes = 2;
+  optional int32  max_body_bytes = 3;
+  optional string content_type   = 4;
+  repeated int32  expected_status = 5;  // empty = any 2xx is pass
+
+  // Offload tier (control plane, sampled)
+  int32  sample_every_n = 10;          // 0 = no sampling
+  bool   ship_bodies    = 11;          // ship sampled bodies up for offload eval
+  int32  max_sampled_body_bytes = 12;  // cap shipped body size; truncate beyond
+
+  // Note: the schemas/paths/regexes themselves live in the control plane offload pool,
+  // not in the worker — workers ship raw bodies + metadata, eval happens off the hot path.
+}
+
+message RateLimitPolicy {
+  // What the worker does when it sees a 429 from the target.
+  // The 429 is OUR load artifact, never folded into the API's correctness score.
+  RateLimitAction action = 1;
+  int32  max_backoff_ms  = 2;   // cap on Retry-After honoring (avoid pathological waits)
+  bool   record_onset    = 3;   // surface first-429-RPS as a measured property
+}
+
+enum RateLimitAction {
+  RL_CONTINUE = 0;   // log and keep firing (you'll wall-bang; not recommended)
+  RL_BACKOFF  = 1;   // honor Retry-After up to max_backoff_ms; reduce effective RPS
+  RL_ABORT    = 2;   // stop the run (for cost-sensitive metered APIs)
+}
+
+// ============================================================
+// WORKER EVENTS (up) — server-streaming on RunSlice
+// ============================================================
+
+message WorkerEvent {
+  oneof kind {
+    Started   started   = 1;   // sent once, after epoch reached
+    Partial   partial   = 2;   // 1s ticks
+    Saturated saturated = 3;   // self-instrumentation: worker can't keep schedule
+    Error     error     = 4;   // recoverable error; run continues
+  }
+}
+
+message Started {
+  int64 actual_start_unix_us = 1;  // worker confirms it began at epoch (within ±N us)
+  int64 skew_us = 2;               // clock skew vs coordinator (for diagnostics)
+}
+
+message Partial {
+  string worker_id = 1;
+  uint64 tick      = 2;            // monotonic, 1s
+  bool   final     = 3;            // true on the last Partial of the stream
+
+  // Latency
+  bytes  corrected_hist   = 4;     // serialized HDR V2 compressed (whole-run-to-date)
+  bytes  uncorrected_hist = 5;     // serialized HDR; delta vs corrected = COO error
+  bytes  ttfb_hist        = 6;     // serialized HDR for time-to-first-byte
+  bytes  this_tick_corrected = 7;  // delta-since-last-tick (for live charts)
+
+  // Correctness, bucketed by RPS-at-send
+  repeated RpsBucket buckets = 8;
+
+  // Load/health
+  double offered_rps  = 9;         // what we tried to send this tick
+  double achieved_rps = 10;        // what we actually sent
+  uint64 sched_slip_us = 11;       // worker self-instrumentation
+  bool   client_saturated = 12;
+  uint32 in_flight = 13;
+  uint32 conn_errors = 14;
+  uint32 timeouts    = 15;
+
+  // Rate-limit signal (first-class, never folded into correctness)
+  RateLimit rate_limit = 16;
+
+  // Bytes (for payload-aware analyses later)
+  uint64 bytes_sent = 17;
+  uint64 bytes_recv = 18;
+
+  // Sampled bodies for offload eval (only if AssertSpec.ship_bodies)
+  repeated SampledResponse sampled = 19;
+}
+
+message RpsBucket {
+  double rps_lo = 1;
+  double rps_hi = 2;
+  uint64 total  = 3;
+  uint64 pass   = 4;
+
+  // Failure classes — separate stories, separate causes (charted distinctly)
+  uint64 fail_transport = 5;   // connect refused, reset, DNS, TLS
+  uint64 fail_status    = 6;   // got a response, wrong status (5xx, unexpected 4xx)
+  uint64 fail_latency   = 7;   // exceeded max_latency_us
+  uint64 fail_size      = 8;   // body too small/large (truncation, etc.)
+  uint64 fail_content_type = 9;
+
+  uint64 rate_limited   = 10;  // 429 — OUR artifact, not the API's degradation
+  uint64 timeout        = 11;  // distinct from latency-threshold-fail
+}
+
+message RateLimit {
+  uint64 count_this_tick   = 1;
+  optional double first_429_rps = 2;   // measured: the RPS bucket where 429s began (run-wide)
+  optional int64  last_retry_after_ms = 3;
+  uint64 backoff_us_total  = 4;        // cumulative wait time spent honoring backoff
+}
+
+message SampledResponse {
+  double rps_at_send = 1;
+  int32  status      = 2;
+  int64  corrected_lat_us = 3;
+  int64  ttfb_us     = 4;
+  map<string,string> response_headers = 5;  // for offload eval (content-type, schema hints)
+  bytes  body        = 6;                   // may be truncated to max_sampled_body_bytes
+  bool   body_truncated = 7;
+}
+
+message Saturated {
+  uint64 slip_us = 1;
+  string reason  = 2;   // "cpu", "io", "conn_pool", etc.
+}
+
+message Error {
+  string code    = 1;   // see ERROR CODES below
+  string message = 2;
+  bool   fatal   = 3;   // true → worker is about to exit; false → recoverable
+}
+
+// ============================================================
+// HEALTH (independent stream)
+// ============================================================
+
+message WorkerHealth {
+  string worker_id = 1;
+  string run_id    = 2;            // empty if idle
+  int64  ts_unix_us = 3;
+  double cpu_pct   = 4;
+  uint64 rss_bytes = 5;
+  uint32 fd_count  = 6;
+}
+
+message HealthAck { bool ok = 1; }
+
+// ============================================================
+// ABORT
+// ============================================================
+
+message AbortRequest {
+  string run_id    = 1;
+  string worker_id = 2;   // empty = all workers for this run
+  string reason    = 3;
+}
+
+message AbortAck {
+  bool accepted = 1;
+}
+
+// ============================================================
+// ERROR CODES (string constants for the Error.code field)
+// ============================================================
+//
+//   "CONTRACT_VERSION_MISMATCH"   — handshake failed; worker refuses assignment
+//   "TARGET_UNREACHABLE"          — initial DNS/connect failed; nothing fired
+//   "CLIENT_SATURATED"            — worker can't keep schedule (also Saturated event)
+//   "TLS_HANDSHAKE_FAIL"
+//   "ASSERT_SPEC_INVALID"
+//   "INTERNAL"                    — worker bug; fatal=true
+//
+// ============================================================

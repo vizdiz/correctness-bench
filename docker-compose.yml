@@ -1,0 +1,99 @@
+# Single docker-compose for local dev AND the deploy VM (per design §14).
+# Services wired this session: postgres (Timescale), mock, control, web.
+# coordinator + worker-1..N are SUPERVISED engine work — left as commented
+# placeholders so the topology is documented but nothing half-built runs.
+#
+# NOTE: these were authored during a session with no Docker runtime available,
+# so they are NOT yet `docker compose up`-verified end to end. The mock and
+# control plane were verified natively (cargo run / go test against a local
+# Postgres). See docs/BUILD_LOG.md.
+
+name: correctness-bench
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench -d bench"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [bench]
+
+  mock:
+    build:
+      context: ./mock
+    # Fixed port so gates and demos reproduce.
+    ports:
+      - "8080:8080"
+    environment:
+      MOCK_ADDR: "0.0.0.0:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    networks: [bench]
+
+  control:
+    build:
+      context: ./control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # libpq-style DSN consumed by pgx.
+      DATABASE_URL: "postgres://bench:bench@postgres:5432/bench?sslmode=disable"
+      CONTROL_ADDR: ":8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [bench]
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.dev
+    depends_on:
+      - control
+    environment:
+      # web talks to control; in the browser this resolves to localhost:8000.
+      VITE_CONTROL_BASE_URL: "http://localhost:8000"
+    ports:
+      - "5173:5173"
+    networks: [bench]
+
+  # ---- SUPERVISED ENGINE WORK (do not uncomment until built with a human) ----
+  # coordinator:
+  #   build: { context: ./engine, dockerfile: Dockerfile.coordinator }
+  #   environment:
+  #     CONTROL_URL: "http://control:8000"
+  #   networks: [bench]
+  #
+  # worker:
+  #   build: { context: ./engine, dockerfile: Dockerfile.worker }
+  #   environment:
+  #     COORDINATOR_URL: "coordinator:9090"
+  #   deploy:
+  #     replicas: 4   # default fleet size (design §13)
+  #   depends_on: [coordinator]
+  #   networks: [bench]
+
+volumes:
+  pgdata:
+
+networks:
+  bench:
+    driver: bridge

@@ -1,0 +1,12 @@
+[package]
+name = "engine"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The worker + coordinator (COO scheduler, HDR, gRPC, fleet) live here.
+# This is SUPERVISED work — implemented with a human in the loop (see .claude/agents/engine.md).
+# Intentionally left as a stub during the overnight scaffolding session.
+
+[lib]
+path = "src/lib.rs"
