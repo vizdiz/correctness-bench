@@ -298,4 +298,31 @@ work: containerize the engine for fair network parity (fast win), then drop
 reqwest for raw hyper, reduce per-request alloc, and possibly switch to a 1-task-
 per-OS-thread connection model. Documented for follow-up.
 
+## 2026-05-30 — Engine containerized; fair gate-#1 comparison (still over ±5%)
+
+Wrote `engine/Dockerfile` (build context = repo root so the mock dev-dep
+resolves) so the engine and wrk2 both run inside the compose bridge net hitting
+`mock:8080` directly — apples to apples on the network path.
+
+| metric            | wrk2 -t4 | wrk2 -t1 | engine (container) | engine vs wrk2 |
+|-------------------|----------|----------|--------------------|----------------|
+| achieved rps      | 1997.94  | 1991.83  | 1999.8             | within 0.5%    |
+| corrected p50     | 22.62 ms | 22.93 ms | 30.0 ms            | +33%           |
+| corrected p99     | 24.91 ms | 25.20 ms | 35.8 ms            | +44%           |
+| uncorrected p50   | 21.45 ms | 21.89 ms | 25.0 ms            | +17%           |
+| uncorrected p99   | 22.91 ms | 23.30 ms | 29.6 ms            | +29%           |
+
+`wrk2 -t1` (single thread, matches the engine's runtime model) and `wrk2 -t4`
+give essentially the same numbers, ruling out OS-thread count as the cause.
+**The gap is ~3-7ms of per-request overhead in reqwest+Tokio above
+hyper+libev:** body-drain allocation, async task scheduling slip at ~120k
+requests/run, and the reqwest abstraction surface. The COO correction itself is
+correct (the corrected/uncorrected delta tracks wrk2's — both about 1-2ms).
+
+**Gate #1 numerical agreement (±5%): NOT YET CLOSED.** Engineering path to
+close: replace `reqwest` with hyper-h1 directly, hoist the request object so
+clone_request is allocation-free, consider a 1-task-per-connection-per-OS-thread
+model, profile where the per-request cost is going. This is a separate
+optimization phase from "build the engine," and is documented for follow-up.
+
 <!-- Subsequent phases append below this line. -->
