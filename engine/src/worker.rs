@@ -17,14 +17,16 @@
 //! balloons. Stagger pushed corrected p50 from ~30 ms down to ~23 ms in our
 //! measurements (wrk2 is 22.6 ms).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use http::{Method, Uri};
+use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Barrier;
+use tokio::sync::{mpsc, Barrier};
 use tokio::task::JoinSet;
 
 use crate::hist::{Histos, Summary};
@@ -81,6 +83,29 @@ fn is_pass(status: u16, expected: &[u16]) -> bool {
     }
 }
 
+/// Atomic counters shared across all connection tasks for the 1 Hz tick emitter.
+/// Updated on every completed request with Relaxed ordering (we tolerate the
+/// occasional out-of-order observation — exact counts are recomputed at the
+/// end of the run from each task's local `ConnResult`).
+#[derive(Default)]
+struct LiveCounters {
+    completed: AtomicU64,
+    pass: AtomicU64,
+    fail_status: AtomicU64,
+}
+
+/// One-second snapshot of the run's progress. Designed to map onto api.md's
+/// SSE `tick` event shape (subset) so it can be streamed to the control plane
+/// later with no shape change.
+#[derive(Debug, Clone, Serialize)]
+pub struct Tick {
+    pub elapsed_s: u64,
+    pub achieved_rps_1s: f64,
+    pub completed_total: u64,
+    pub pass_total: u64,
+    pub fail_status_total: u64,
+}
+
 /// Tail-wait threshold: above this we sleep, below we spin. With staggered
 /// schedules the runtime rarely has more than one task spinning at a time, so
 /// a tight cooperative spin replaces the timer-wheel granularity.
@@ -90,7 +115,19 @@ const SPIN_THRESHOLD_US: u64 = 100;
 /// single HTTP/1.1 response we expect to benchmark.
 const READ_BUF_BYTES: usize = 64 * 1024;
 
+/// Drive the spec to completion with no live-tick stream. Equivalent to
+/// `run_with_ticks(spec, None)`.
 pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
+    run_with_ticks(spec, None).await
+}
+
+/// Drive the spec to completion. If `tick_tx` is provided, a background
+/// task emits a [`Tick`] event each second containing cumulative counters and
+/// the last-second achieved RPS.
+pub async fn run_with_ticks(
+    spec: RunSpec,
+    tick_tx: Option<mpsc::UnboundedSender<Tick>>,
+) -> anyhow::Result<RunReport> {
     let host = spec
         .url
         .host()
@@ -131,17 +168,21 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
     let timeout = spec.timeout;
 
     let expected_status = Arc::new(spec.expected_status.clone());
+    let counters = Arc::new(LiveCounters::default());
+
     let mut joinset: JoinSet<ConnResult> = JoinSet::new();
     for conn_id in 0..spec.connections {
         let host = host.clone();
         let barrier = barrier.clone();
         let req_bytes = req_bytes.clone();
         let expected_status = expected_status.clone();
+        let counters = counters.clone();
         let mut rx = worker_start_rx_template.clone();
         let offset_us = conn_id as u64 * stagger_us;
         joinset.spawn(async move {
             connection_task(
-                host, port, req_bytes, expected_status, per_conn_throughput_us, offset_us,
+                host, port, req_bytes, expected_status, counters,
+                per_conn_throughput_us, offset_us,
                 spec.duration_s, timeout, barrier, &mut rx,
             )
             .await
@@ -151,6 +192,39 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
     barrier.wait().await;
     let worker_start = Instant::now();
     let _ = worker_start_tx.send(Some(worker_start));
+
+    // Spawn 1Hz tick emitter (only if the caller subscribed). The task ends
+    // when the run deadline passes or when the sender is dropped.
+    let tick_handle = tick_tx.map(|tx| {
+        let counters = counters.clone();
+        let duration_s = spec.duration_s;
+        tokio::spawn(async move {
+            let mut prev_completed = 0u64;
+            for elapsed_s in 1..=duration_s {
+                tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(worker_start + Duration::from_secs(elapsed_s)),
+                )
+                .await;
+                let c = counters.completed.load(Ordering::Relaxed);
+                let p = counters.pass.load(Ordering::Relaxed);
+                let f = counters.fail_status.load(Ordering::Relaxed);
+                let achieved_rps_1s = (c - prev_completed) as f64;
+                prev_completed = c;
+                if tx
+                    .send(Tick {
+                        elapsed_s,
+                        achieved_rps_1s,
+                        completed_total: c,
+                        pass_total: p,
+                        fail_status_total: f,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
 
     let mut merged = Histos::new();
     let mut conn_errors = 0u64;
@@ -166,6 +240,10 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
         total_completed += res.completed;
         total_pass += res.pass;
         total_fail_status += res.fail_status;
+    }
+
+    if let Some(h) = tick_handle {
+        h.abort();
     }
 
     let elapsed = worker_start.elapsed();
@@ -194,6 +272,7 @@ async fn connection_task(
     port: u16,
     req_bytes: Arc<Vec<u8>>,
     expected_status: Arc<Vec<u16>>,
+    counters: Arc<LiveCounters>,
     throughput_us: f64,
     offset_us: u64,
     duration_s: u64,
@@ -282,10 +361,13 @@ async fn connection_task(
         let uncorrected = recv_us.saturating_sub(actual_send_us).max(1);
         res.histos.record(corrected, uncorrected);
         res.completed += 1;
+        counters.completed.fetch_add(1, Ordering::Relaxed);
         if is_pass(status, &expected_status) {
             res.pass += 1;
+            counters.pass.fetch_add(1, Ordering::Relaxed);
         } else {
             res.fail_status += 1;
+            counters.fail_status.fetch_add(1, Ordering::Relaxed);
         }
 
         // Shift any pipelined-extra bytes to the front. Without pipelining

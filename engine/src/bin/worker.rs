@@ -49,6 +49,11 @@ struct Cli {
     /// Repeat to allow multiple, e.g. `--expected-status 200 --expected-status 204`.
     #[arg(long)]
     expected_status: Vec<u16>,
+
+    /// Emit a JSON-line per second on stdout (live tick stream): elapsed_s,
+    /// achieved_rps_1s, completed_total, pass_total, fail_status_total.
+    #[arg(long)]
+    ticks: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -89,7 +94,23 @@ fn main() -> anyhow::Result<()> {
             if cli.worker_threads == 0 { "auto".to_string() } else { cli.worker_threads.to_string() },
         );
 
-        let report = engine::run(spec).await?;
+        // Optional live tick channel. If --ticks, spawn a printer task that
+        // emits one JSON line per tick to stdout.
+        let tick_tx = if cli.ticks {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<engine::Tick>();
+            tokio::spawn(async move {
+                while let Some(tick) = rx.recv().await {
+                    if let Ok(line) = serde_json::to_string(&tick) {
+                        println!("{line}");
+                    }
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
+
+        let report = engine::run_with_ticks(spec, tick_tx).await?;
 
         println!();
         println!(
