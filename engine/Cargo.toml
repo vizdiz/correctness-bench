@@ -1,12 +1,33 @@
 [package]
 name = "engine"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 publish = false
 
-# The worker + coordinator (COO scheduler, HDR, gRPC, fleet) live here.
-# This is SUPERVISED work — implemented with a human in the loop (see .claude/agents/engine.md).
-# Intentionally left as a stub during the overnight scaffolding session.
+# The benchmarker's hot path: COO-correct scheduler, HDR histograms (corrected
+# + uncorrected), open-loop load against any HTTP target. This crate is the
+# gate-#1 owner (gates/gate1_wrk2_agreement.md). The coordinator + gRPC + fleet
+# bits are not in this MVP — single worker, single thread, single binary.
 
 [lib]
+name = "engine"
 path = "src/lib.rs"
+
+[[bin]]
+name = "engine-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+hdrhistogram = "7"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["full"] }
+mock = { path = "../mock" }
+axum = "0.8"

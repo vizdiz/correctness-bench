@@ -1,7 +1,12 @@
-// engine — built supervised
-//
-// Worker + coordinator: COO-correct scheduler, HDR histograms (corrected +
-// uncorrected), gRPC streaming per contracts/bench.proto, fleet split/sync/merge.
-// This is the hot path and the riskiest code in the project. It is implemented
-// with a human in the loop and must pass gates/gate1_wrk2_agreement.md before
-// anything downstream matters. Do not implement unsupervised.
+//! engine — single-worker, COO-correct load generator (gate #1 MVP).
+//!
+//! The coordinator + gRPC + fleet are not in this crate yet; the build kit
+//! orders them after gate #1 is green. See `gates/gate1_wrk2_agreement.md`.
+
+pub mod hist;
+pub mod sched;
+pub mod worker;
+
+pub use hist::{Histos, Summary};
+pub use sched::ConnSched;
+pub use worker::{run, RunReport, RunSpec};

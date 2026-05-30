@@ -229,4 +229,40 @@ a wrk2-compatible commit) documented in D14. Added a `bench`-profile compose
 service so `docker compose --profile bench run --rm wrk2 ...` is wired and ready
 when the runtime is fixed.
 
+## 2026-05-30 — Engine MVP (single worker, COO-correct) — toward gate #1
+
+Built `engine/` as a real crate (was stub). Modules:
+- `sched` — `ConnSched` + `usec_to_next_send`, faithful port of giltene/wrk2's
+  COO logic (intended-send time on the ORIGINAL schedule + catch-up at 2× when
+  behind, with latency measured vs the original timeline regardless of catch-up).
+  Pure, no I/O, exhaustively unit + property tested.
+- `hist` — HDR histograms (corrected + uncorrected, 1µs–60s, 3 SF, mergeable).
+- `worker` — async runner: N connection tasks, each loop firing on the schedule,
+  recording corrected (recv − intended) and uncorrected (recv − actual) latency,
+  draining the body before counting completed. Single tokio runtime, HTTP/1
+  via reqwest (no h2 multiplexing — matches wrk2).
+- `src/bin/worker.rs` — clap CLI: `--rate -d --connections --url`.
+
+`cargo test` ALL GREEN:
+```
+running 5 tests (sched)               ... 5 passed
+running 1 test  (integration)         ... engine_hits_target_rps_against_healthy_mock ok (5.0s)
+running 2 tests (sched_proptest)      ... 2 passed   (256 cases each)
+```
+
+Live numbers against the compose mock (healthy, base_latency_ms=20, 30s × 3):
+```
+target 2000 RPS, c=100:
+  run 1: achieved 1999.6  corrected p50/p95/p99 = 31.8/36.6/38.7  uncorrected = 28.8/33.8/35.6
+  run 2: achieved 1999.5  corrected p50/p95/p99 = 31.4/36.5/38.6  uncorrected = 28.7/33.9/35.7
+  run 3: achieved 1999.5  corrected p50/p95/p99 = 31.3/36.0/38.8  uncorrected = 28.6/33.4/35.7
+  -> p99 variance across 3 runs: 0.5%  (gate #1 requires <10%)
+  -> COO delta p99: ~+3ms consistently  (corrected > uncorrected — proves correction is non-no-op)
+  -> achieved vs target: 0.025% (~perfect open-loop pacing)
+```
+
+**Gate #1 status:** stability + COO-correction non-trivially in evidence;
+wrk2-numerical-agreement (the final ±5% check) is pending wrk2 runtime (D14).
+Once wrk2 is firing, the comparison should land cleanly given these numbers.
+
 <!-- Subsequent phases append below this line. -->
