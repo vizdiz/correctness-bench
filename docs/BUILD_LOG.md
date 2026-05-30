@@ -194,4 +194,39 @@ wiring are verified; the visual design is unconfirmed (D10). Dockerfile.dev +
 .dockerignore written, compose `web` env switched to CONTROL_PROXY_TARGET. NOT
 docker-build-verified (no Docker).
 
+## 2026-05-30 — Docker + Timescale + wrk2 prep
+
+**Docker dev loop is live (closes D2 + D12).** Symlinked Docker Desktop's
+`docker` CLI + `docker-compose` plugin into PATH. `docker compose up -d` brought
+all four services healthy:
+```
+postgres (timescale/timescaledb:latest-pg16, healthy) :5432
+mock     (correctness-bench-mock,            healthy) :8080
+control  (correctness-bench-control,         healthy) :8000
+web      (correctness-bench-web,             running) :5173
+```
+Timescale 2.27.1 actually loaded; both hypertables `run_ticks` and
+`worker_telemetry` present — goose ran the full frozen schema (no shim).
+
+Canary against the real Timescale postgres: posted a run with two
+canary-bearing headers through live control on :8000 →
+```
+runs row dump grep CANARY_DO_NOT_LEAK -> 0 hits
+control logs grep                     -> 0 hits
+stored target_headers_redacted        -> {"X-Api-Key":"***","Authorization":"***"}
+```
+`cd control && TEST_DATABASE_URL=...:5432/bench go test ./internal/api -count=1`
+all green against Timescale (no shim needed). **D12 closed.**
+
+**wrk2 image built but runtime broken (see DECISIONS D14).** Cloned
+`giltene/wrk2` to gitignored `reference/wrk2`; native macOS build fails (bundled
+LuaJIT 2.0 has no arm64 port). Wrote `tools/wrk2/Dockerfile` + `build.sh` that
+swaps in LuaJIT 2.1 and patches two source incompatibilities. The image builds
+multi-arch natively. `--help` and `--version` work, but every real invocation
+prints Usage and exits 0 — wrk2 4.0's Lua bootstrap is failing under LuaJIT 2.1
+HEAD before getopt. Two clean ways forward (Rosetta toggle, or pin LuaJIT 2.1 to
+a wrk2-compatible commit) documented in D14. Added a `bench`-profile compose
+service so `docker compose --profile bench run --rm wrk2 ...` is wired and ready
+when the runtime is fixed.
+
 <!-- Subsequent phases append below this line. -->

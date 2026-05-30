@@ -45,3 +45,4 @@ secrets/
 /tmp/
 *.descriptor
 pgdata/
+/reference/

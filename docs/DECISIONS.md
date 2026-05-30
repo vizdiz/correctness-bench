@@ -114,3 +114,30 @@ The browser calls same-origin `/v1/...`; the vite dev server proxies to control
 (`CONTROL_PROXY_TARGET`, default localhost:8000; `http://control:8000` in compose).
 Avoids adding CORS to the control plane for v1. **Review:** for a production web
 build (not dev server) you'll need either a reverse proxy or CORS on control.
+
+### [D14] wrk2 lives in `tools/wrk2/` with a LuaJIT 2.1 swap (NOT YET RUNNING)
+wrk2 (gate #1's oracle) bundles LuaJIT 2.0, which has no arm64 port; the
+QEMU/Rosetta `linux/amd64` fallback segfaults its JIT. The Dockerfile in
+`tools/wrk2/` swaps bundled LuaJIT for upstream LuaJIT 2.1 (arm64-capable) and
+patches two source incompatibilities (`luaL_reg` → `luaL_Reg`; guard the x86-only
+`<x86intrin.h>` include). The image builds natively for any arch and `wrk --help`
+works.
+
+**Known issue:** even minimal invocations like `wrk -R 100 URL` print Usage and
+exit 0 — wrk2 4.0's Lua bootstrap (or some pre-getopt step) is failing silently
+under LuaJIT 2.1 HEAD before getopt runs. The binary loads (ELF aarch64), the
+banner prints with `-v`, but anything requiring a real run never gets there.
+
+**Two paths forward (one is enough to close gate #1):**
+1. **Enable Docker Desktop's "Use Rosetta for x86/amd64 emulation" toggle**
+   (Settings → General). Then `docker compose --profile bench run --rm wrk2 ...`
+   with the prebuilt `cylab/wrk2:latest` image works at near-native speed.
+   Quickest fix; needs you to flip the toggle (and restart Docker).
+2. **Pin LuaJIT to a wrk2-known-good 2.1 commit** (`v2.1.0-beta3` tag or one of
+   the early-2020 commits) instead of `v2.1` HEAD, and re-test. The patch
+   surface in `tools/wrk2/build.sh` is isolated to one file.
+
+**Review:** I picked option 1 as the lower-effort default, and option 2 as the
+backup that doesn't depend on host settings. Pick whichever you prefer; the
+engine doesn't block on this — it can be built and tested without wrk2 running,
+and gate #1's numerical agreement check is the very last step.

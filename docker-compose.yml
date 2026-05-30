@@ -76,6 +76,18 @@ services:
       - "5173:5173"
     networks: [bench]
 
+  # wrk2 — gate #1's oracle. Lives behind the `bench` profile so `docker compose
+  # up` doesn't start it; invoke explicitly:
+  #   docker compose --profile bench run --rm wrk2 -t4 -c100 -d60s -R2000 \
+  #       --latency http://mock:8080/api?mode=healthy\&base_latency_ms=20
+  wrk2:
+    profiles: [bench]
+    build:
+      context: ./tools/wrk2
+    image: correctness-bench-wrk2
+    networks: [bench]
+    depends_on: [mock]
+
   # ---- SUPERVISED ENGINE WORK (do not uncomment until built with a human) ----
   # coordinator:
   #   build: { context: ./engine, dockerfile: Dockerfile.coordinator }
