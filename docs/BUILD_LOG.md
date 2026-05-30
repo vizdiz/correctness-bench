@@ -265,4 +265,37 @@ target 2000 RPS, c=100:
 wrk2-numerical-agreement (the final ±5% check) is pending wrk2 runtime (D14).
 Once wrk2 is firing, the comparison should land cleanly given these numbers.
 
+## 2026-05-30 — wrk2 fixed; first gate-#1 numerical comparison (does NOT pass yet)
+
+Root-caused the wrk2 silent-fail: `char c` for getopt's return value vs `-1` is
+ambiguous on arm64 (default unsigned char → 255). `build.sh` now patches it to
+`int c` before make. wrk2 runs natively, hits the requested RPS, produces real
+HDR distributions.
+
+**First side-by-side at the gate #1 shape** (mock healthy, base_latency_ms=20,
+-t4 -c100 -d60s -R2000):
+
+| metric            | wrk2     | engine   | delta   | gate #1 target |
+|-------------------|----------|----------|---------|----------------|
+| achieved rps      | 1997.9   | 1999.5   | +0.08%  | (no formal)    |
+| corrected p50     | 22.6 ms  | 31.5 ms  | +39%    | ≤ ±5%          |
+| corrected p99     | 24.9 ms  | 38.7 ms  | +55%    | ≤ ±5%          |
+| uncorrected p50   | 21.4 ms  | 28.7 ms  | +34%    | (informational)|
+| uncorrected p99   | 22.9 ms  | 35.7 ms  | +56%    | (informational)|
+
+Engine is consistently ~10ms above wrk2 across the board. Diagnosis:
+- ~1-2ms is unfair network path: engine on host hits port-forwarded `localhost:8080`;
+  wrk2 in the compose bridge net hits `mock:8080` directly (one less hop).
+- The rest (~6-8ms) is Tokio + reqwest overhead per request: async runtime
+  scheduling slip at hundreds of in-flight tasks, body-drain alloc, the abstraction
+  surface above hyper. wrk2 uses libev/epoll + 4 OS threads, minimal allocation
+  per request.
+
+**Gate #1 status: not yet green.** Engine is stable, COO-correction-correct (the
+corrected/uncorrected delta tracks wrk2's), and pacing is essentially perfect,
+but the absolute latency floor is too high. Closing the ±5% gap is engine-tuning
+work: containerize the engine for fair network parity (fast win), then drop
+reqwest for raw hyper, reduce per-request alloc, and possibly switch to a 1-task-
+per-OS-thread connection model. Documented for follow-up.
+
 <!-- Subsequent phases append below this line. -->

@@ -128,16 +128,18 @@ exit 0 — wrk2 4.0's Lua bootstrap (or some pre-getopt step) is failing silentl
 under LuaJIT 2.1 HEAD before getopt runs. The binary loads (ELF aarch64), the
 banner prints with `-v`, but anything requiring a real run never gets there.
 
-**Two paths forward (one is enough to close gate #1):**
-1. **Enable Docker Desktop's "Use Rosetta for x86/amd64 emulation" toggle**
-   (Settings → General). Then `docker compose --profile bench run --rm wrk2 ...`
-   with the prebuilt `cylab/wrk2:latest` image works at near-native speed.
-   Quickest fix; needs you to flip the toggle (and restart Docker).
-2. **Pin LuaJIT to a wrk2-known-good 2.1 commit** (`v2.1.0-beta3` tag or one of
-   the early-2020 commits) instead of `v2.1` HEAD, and re-test. The patch
-   surface in `tools/wrk2/build.sh` is isolated to one file.
+**Resolved (2026-05-30):** wrk2's `parse_args` declares `char c` for getopt's
+return and compares against `-1`. On arm64 `char` defaults to unsigned, so
+getopt's `-1` (EOF) becomes `255`, falls through to default, and parse_args
+returns -1 silently. `build.sh` now patches `char c` → `int c` before make. wrk2
+runs natively at full speed:
 
-**Review:** I picked option 1 as the lower-effort default, and option 2 as the
-backup that doesn't depend on host settings. Pick whichever you prefer; the
-engine doesn't block on this — it can be built and tested without wrk2 running,
-and gate #1's numerical agreement check is the very last step.
+```
+$ docker run --rm --network correctness-bench_bench correctness-bench-wrk2 \
+    -t 4 -c 100 -d 60s -R 2000 --latency -U http://mock:8080/api?mode=healthy&base_latency_ms=20
+  Latency Distribution (HdrHistogram - Recorded Latency)
+   50.000%   22.62ms   75.000%   23.34ms   90.000%   23.90ms   99.000%   24.91ms
+  Latency Distribution (HdrHistogram - Uncorrected Latency...)
+   50.000%   21.45ms   75.000%   22.09ms   90.000%   22.34ms   99.000%   22.91ms
+  119886 requests in 1.00m, 28.01MB read   Requests/sec:   1997.94
+```
