@@ -365,8 +365,31 @@ Against wrk2 (`-t4 -c100 -d60s -R2000 --latency -U`):
 | uncorrected p99 | 22.91 | 22.4 | **−2.2%** | (info) ✓ |
 | achieved rps | 1997.94 | 1999.0 | +0.05% | (info) |
 
-**All four points are inside ±5%.** p999/max still show occasional 80+ ms
-spikes — those are gate #1 informational and unrelated to the criteria.
-Stability check (3 runs back-to-back) reported below.
+**All four points are inside ±5%.**
+
+**3-run back-to-back stability check (the full gate #1 criterion):**
+
+| metric            | run 1 | run 2 | run 3 | mean  | wrk2  | engine vs wrk2 |
+|-------------------|-------|-------|-------|-------|-------|----------------|
+| achieved rps      | 1999.0| 1999.0| 1999.0| 1999.0| 1997.9| +0.05%         |
+| corrected p50 ms  | 23.6  | 23.5  | 23.5  | 23.53 | 22.62 | **+4.0%** ✓     |
+| corrected p95 ms  | 24.7  | 24.5  | 24.5  | 24.57 | (~23.90) | within ±5%   |
+| corrected p99 ms  | 24.9  | 24.6  | 24.6  | 24.70 | 24.91 | **−0.8%** ✓     |
+| uncorrected p50 ms| 22.0  | 22.1  | 22.1  | 22.07 | 21.45 | **+2.9%** ✓     |
+| uncorrected p99 ms| 22.4  | 22.4  | 22.5  | 22.43 | 22.91 | **−2.1%** ✓     |
+| COO delta p99 ms  | +2.5  | +2.2  | +2.1  | +2.27 | +1.17 | (non-no-op)    |
+| corrected p999 ms | 26.0  | 25.0  | 28.3  | 26.43 |       |                |
+| corrected max ms  | 38.4  | 27.5  | 35.2  | 33.7  |       |                |
+
+p99 variance across runs: max(24.9) − min(24.6) = 0.3 ms = **1.2%** (gate #1 requires < 10%).
+
+**Gate #1 acceptance check:**
+- [x] engine corrected p50/p95/p99 each within ±5% of wrk2
+- [x] engine uncorrected histogram differs from corrected (COO delta +2.3 ms)
+- [x] 3-run stability — p99 variance 1.2% (< 10%)
+
+**🎯 GATE #1 GREEN.** The single Rust worker's COO-correct scheduler, HDR
+histograms, and request-issuance overhead all agree with wrk2 within tolerance.
+Nothing downstream is blocked anymore.
 
 <!-- Subsequent phases append below this line. -->
