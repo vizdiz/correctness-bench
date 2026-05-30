@@ -77,6 +77,9 @@ export interface Tick {
   completed_total: number
   pass_total: number
   fail_status_total: number
+  /** Counts FOR THIS TICK only — per-second deltas. The headline green line
+      plots `this_tick.pass / this_tick.total` to show the per-second cliff. */
+  this_tick: { total: number; pass: number; fail_status: number }
   ts?: string
 }
 

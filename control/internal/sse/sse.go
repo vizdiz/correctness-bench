@@ -21,7 +21,16 @@ type Tick struct {
 	CompletedTotal  uint64    `json:"completed_total"`
 	PassTotal       uint64    `json:"pass_total"`
 	FailStatusTotal uint64    `json:"fail_status_total"`
+	ThisTick        ThisTick  `json:"this_tick"`
 	TS              time.Time `json:"ts,omitempty"` // server-stamped on ingest
+}
+
+// ThisTick holds the counts attributable to JUST the last 1 s window. Per-tick
+// pass rate (pass / total) is what the web's cliff sparkline plots.
+type ThisTick struct {
+	Total      uint64 `json:"total"`
+	Pass       uint64 `json:"pass"`
+	FailStatus uint64 `json:"fail_status"`
 }
 
 // Broker fans run-scoped Ticks out to N concurrent subscribers per run.

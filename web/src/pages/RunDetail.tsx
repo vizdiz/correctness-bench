@@ -73,12 +73,13 @@ export function RunDetail() {
 
   const canAbort = !terminal.has(run.status)
   const latest = ticks.length > 0 ? ticks[ticks.length - 1] : null
+  // Per-tick pass rate is the headline (this 1 s window, not cumulative).
   const passRate =
-    latest && latest.completed_total > 0
-      ? (latest.pass_total / latest.completed_total) * 100
+    latest && latest.this_tick.total > 0
+      ? (latest.this_tick.pass / latest.this_tick.total) * 100
       : null
   const correctnessSeries = ticks.map((t) =>
-    t.completed_total > 0 ? t.pass_total / t.completed_total : 1,
+    t.this_tick.total > 0 ? t.this_tick.pass / t.this_tick.total : 1,
   )
   const rpsSeries = ticks.map((t) => t.achieved_rps_1s)
 

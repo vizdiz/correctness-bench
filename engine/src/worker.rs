@@ -94,9 +94,8 @@ struct LiveCounters {
     fail_status: AtomicU64,
 }
 
-/// One-second snapshot of the run's progress. Designed to map onto api.md's
-/// SSE `tick` event shape (subset) so it can be streamed to the control plane
-/// later with no shape change.
+/// One-second snapshot of the run's progress. Shape is a subset of api.md's
+/// SSE `tick` event so the engine can grow into the canonical shape additively.
 #[derive(Debug, Clone, Serialize)]
 pub struct Tick {
     pub elapsed_s: u64,
@@ -104,6 +103,17 @@ pub struct Tick {
     pub completed_total: u64,
     pub pass_total: u64,
     pub fail_status_total: u64,
+    /// Counts FOR THIS TICK only — what arrived in the last 1 s. Matches
+    /// api.md's `this_tick` nested object. Per-tick pass rate
+    /// (`this_tick.pass / this_tick.total`) is the per-second cliff.
+    pub this_tick: ThisTick,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThisTick {
+    pub total: u64,
+    pub pass: u64,
+    pub fail_status: u64,
 }
 
 /// Tail-wait threshold: above this we sleep, below we spin. With staggered
@@ -200,6 +210,8 @@ pub async fn run_with_ticks(
         let duration_s = spec.duration_s;
         tokio::spawn(async move {
             let mut prev_completed = 0u64;
+            let mut prev_pass = 0u64;
+            let mut prev_fail_status = 0u64;
             for elapsed_s in 1..=duration_s {
                 tokio::time::sleep_until(
                     tokio::time::Instant::from_std(worker_start + Duration::from_secs(elapsed_s)),
@@ -208,8 +220,15 @@ pub async fn run_with_ticks(
                 let c = counters.completed.load(Ordering::Relaxed);
                 let p = counters.pass.load(Ordering::Relaxed);
                 let f = counters.fail_status.load(Ordering::Relaxed);
-                let achieved_rps_1s = (c - prev_completed) as f64;
+                let this_tick = ThisTick {
+                    total: c.saturating_sub(prev_completed),
+                    pass: p.saturating_sub(prev_pass),
+                    fail_status: f.saturating_sub(prev_fail_status),
+                };
+                let achieved_rps_1s = this_tick.total as f64;
                 prev_completed = c;
+                prev_pass = p;
+                prev_fail_status = f;
                 if tx
                     .send(Tick {
                         elapsed_s,
@@ -217,6 +236,7 @@ pub async fn run_with_ticks(
                         completed_total: c,
                         pass_total: p,
                         fail_status_total: f,
+                        this_tick,
                     })
                     .is_err()
                 {

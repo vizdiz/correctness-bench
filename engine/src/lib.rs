@@ -9,4 +9,4 @@ pub mod worker;
 
 pub use hist::{Histos, Summary};
 pub use sched::ConnSched;
-pub use worker::{run, run_with_ticks, RunReport, RunSpec, Tick};
+pub use worker::{run, run_with_ticks, RunReport, RunSpec, ThisTick, Tick};
