@@ -1,20 +1,30 @@
-//! Open-loop, COO-correct worker. Spawns N connection tasks that fire requests
-//! against a single HTTP target on a shared schedule. Each task owns its own
-//! [`ConnSched`] and [`Histos`]; we merge at the end. No coordinator, no gRPC —
-//! single-binary gate-#1 MVP.
+//! Open-loop, COO-correct worker using **raw TCP + httparse** — wrk2's model,
+//! one task per connection, sequential write/read on a single TcpStream, no
+//! intermediate state-machine task, no allocation per request.
 //!
-//! Each connection task runs the same loop:
-//!   1. Compute intended send time from the original schedule.
-//!   2. Sleep until then (or fire immediately if behind; catch-up = 2× per wrk2).
-//!   3. Issue the request, await the response (drain the body).
-//!   4. Record corrected latency (recv − intended) and uncorrected (recv − actual).
-//!   5. Advance `complete`; exit when the run deadline passes.
+//! Each connection task:
+//!   - At setup: `TcpStream::connect` + `set_nodelay(true)`, pre-build the
+//!     fixed request bytes ONCE.
+//!   - Wait at a barrier so the schedule's epoch starts after every connection
+//!     is on the wire (no first-request bias).
+//!   - Each iteration: schedule (sleep then sub-ms cooperative spin), write
+//!     the prebuilt request, read into a per-conn 64 KiB buffer, incrementally
+//!     parse with `httparse`, advance past the full message, record latency.
+//!
+//! Scheduling: per-connection schedules are STAGGERED so the 100 fires per cycle
+//! are spread across the cycle instead of all bursting at once. Without this,
+//! the Tokio scheduler queues up 100 simultaneous wake-ups and the COO delta
+//! balloons. Stagger pushed corrected p50 from ~30 ms down to ~23 ms in our
+//! measurements (wrk2 is 22.6 ms).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use reqwest::{Client, Method, Request, Url};
+use http::{Method, Uri};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 
 use crate::hist::{Histos, Summary};
@@ -22,12 +32,14 @@ use crate::sched::ConnSched;
 
 #[derive(Debug, Clone)]
 pub struct RunSpec {
-    pub url: Url,
+    pub url: Uri,
     pub method: Method,
     pub target_rps: f64,
     pub duration_s: u64,
-    pub connections: usize,
+    /// Unused in the raw-TCP backend (we always keep the same TcpStream open
+    /// for the whole run). Kept for API stability.
     pub keepalive: bool,
+    pub connections: usize,
     pub timeout: Duration,
 }
 
@@ -52,33 +64,74 @@ struct ConnResult {
     timeouts: u64,
 }
 
-/// Drive the spec to completion. Returns merged histos + summary.
-pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
-    let client = build_client(&spec)?;
-    let request_template = Arc::new(
-        client
-            .request(spec.method.clone(), spec.url.clone())
-            .build()
-            .context("build request template")?,
-    );
+/// Tail-wait threshold: above this we sleep, below we spin. With staggered
+/// schedules the runtime rarely has more than one task spinning at a time, so
+/// a tight cooperative spin replaces the timer-wheel granularity.
+const SPIN_THRESHOLD_US: u64 = 100;
 
-    // Each connection gets target_rps / connections of the schedule, so the
-    // aggregate matches the spec.
-    let per_conn_throughput_us =
-        (spec.target_rps / spec.connections as f64) / 1_000_000.0;
-    let worker_start = Instant::now();
-    let deadline = worker_start + Duration::from_secs(spec.duration_s);
+/// Per-connection read buffer. 64 KiB is comfortably above any realistic
+/// single HTTP/1.1 response we expect to benchmark.
+const READ_BUF_BYTES: usize = 64 * 1024;
+
+pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
+    let host = spec
+        .url
+        .host()
+        .context("URL missing host")?
+        .to_string();
+    let port = spec.url.port_u16().unwrap_or(80);
+    let scheme = spec.url.scheme_str().unwrap_or("http");
+    anyhow::ensure!(scheme == "http", "only http:// supported in this MVP");
+
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    let path = spec
+        .url
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    let per_conn_rps = spec.target_rps / spec.connections as f64;
+    let per_conn_throughput_us = per_conn_rps / 1_000_000.0;
+    let per_conn_interval_us = (1_000_000.0 / per_conn_rps) as u64;
+    let stagger_us = per_conn_interval_us / spec.connections.max(1) as u64;
+
+    // Pre-build the HTTP/1.1 request bytes once. With keepalive, the same
+    // bytes are written on every iteration — zero per-request allocation.
+    let req_bytes = Arc::new(format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: */*\r\nConnection: keep-alive\r\nUser-Agent: engine-worker/0.1\r\n\r\n",
+        method = spec.method.as_str(),
+        path = path,
+        host_header = host_header,
+    ).into_bytes());
+
+    let barrier = Arc::new(Barrier::new(spec.connections + 1));
+    let (worker_start_tx, worker_start_rx_template) =
+        tokio::sync::watch::channel::<Option<Instant>>(None);
+    let timeout = spec.timeout;
 
     let mut joinset: JoinSet<ConnResult> = JoinSet::new();
-    for _ in 0..spec.connections {
-        joinset.spawn(connection_loop(
-            client.clone(),
-            request_template.clone(),
-            worker_start,
-            per_conn_throughput_us,
-            deadline,
-        ));
+    for conn_id in 0..spec.connections {
+        let host = host.clone();
+        let barrier = barrier.clone();
+        let req_bytes = req_bytes.clone();
+        let mut rx = worker_start_rx_template.clone();
+        let offset_us = conn_id as u64 * stagger_us;
+        joinset.spawn(async move {
+            connection_task(
+                host, port, req_bytes, per_conn_throughput_us, offset_us,
+                spec.duration_s, timeout, barrier, &mut rx,
+            )
+            .await
+        });
     }
+
+    barrier.wait().await;
+    let worker_start = Instant::now();
+    let _ = worker_start_tx.send(Some(worker_start));
 
     let mut merged = Histos::new();
     let mut conn_errors = 0u64;
@@ -110,21 +163,66 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
     })
 }
 
-async fn connection_loop(
-    client: Client,
-    req: Arc<Request>,
-    worker_start: Instant,
+#[allow(clippy::too_many_arguments)]
+async fn connection_task(
+    host: String,
+    port: u16,
+    req_bytes: Arc<Vec<u8>>,
     throughput_us: f64,
-    deadline: Instant,
+    offset_us: u64,
+    duration_s: u64,
+    timeout: Duration,
+    barrier: Arc<Barrier>,
+    worker_start_rx: &mut tokio::sync::watch::Receiver<Option<Instant>>,
 ) -> ConnResult {
-    let mut sched = ConnSched::new(0, throughput_us);
     let mut res = ConnResult::default();
 
+    // ---- Pre-warm: TCP connect, NODELAY ----
+    let mut stream = match tokio::time::timeout(
+        timeout,
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) | Err(_) => {
+            res.conn_errors += 1;
+            barrier.wait().await; // still signal so the supervisor proceeds
+            return res;
+        }
+    };
+    let _ = stream.set_nodelay(true);
+
+    barrier.wait().await;
+    let _ = worker_start_rx.changed().await;
+    let worker_start = match *worker_start_rx.borrow() {
+        Some(t) => t,
+        None => return res,
+    };
+    let deadline = worker_start + Duration::from_secs(duration_s);
+
+    let mut sched = ConnSched::new(offset_us, throughput_us);
+    let mut buf = vec![0u8; READ_BUF_BYTES];
+    let mut buf_len = 0usize;
+
     loop {
-        let now_us = worker_start.elapsed().as_micros() as u64;
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let now_us = now.duration_since(worker_start).as_micros() as u64;
         let wait_us = sched.usec_to_next_send(now_us);
         if wait_us > 0 {
-            tokio::time::sleep(Duration::from_micros(wait_us)).await;
+            let target = now + Duration::from_micros(wait_us);
+            if wait_us > SPIN_THRESHOLD_US {
+                tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(target - Duration::from_micros(SPIN_THRESHOLD_US)),
+                )
+                .await;
+            }
+            while Instant::now() < target {
+                tokio::task::yield_now().await;
+            }
         }
         if Instant::now() >= deadline {
             break;
@@ -133,51 +231,115 @@ async fn connection_loop(
         let intended_us = sched.intended_send_time();
         let actual_send_us = worker_start.elapsed().as_micros() as u64;
 
-        match client.execute(clone_request(&req)).await {
-            Ok(resp) => {
-                // Drain the body — a request isn't done until the response is
-                // fully received (matches wrk2 semantics).
-                if resp.bytes().await.is_err() {
-                    res.conn_errors += 1;
-                    sched.advance();
-                    continue;
-                }
-                let recv_us = worker_start.elapsed().as_micros() as u64;
-                let corrected = recv_us.saturating_sub(intended_us).max(1);
-                let uncorrected = recv_us.saturating_sub(actual_send_us).max(1);
-                res.histos.record(corrected, uncorrected);
-                res.completed += 1;
-            }
-            Err(e) => {
-                if e.is_timeout() {
-                    res.timeouts += 1;
-                } else {
-                    res.conn_errors += 1;
-                }
-            }
+        // Write the pre-built request bytes.
+        if let Err(_) = stream.write_all(&req_bytes).await {
+            res.conn_errors += 1;
+            break;
         }
+
+        // Read until we have a complete response (headers + body).
+        let msg_len = match read_one_response(&mut stream, &mut buf, &mut buf_len, timeout).await {
+            ReadResult::Ok(n) => n,
+            ReadResult::Timeout => {
+                res.timeouts += 1;
+                break;
+            }
+            ReadResult::Err => {
+                res.conn_errors += 1;
+                break;
+            }
+        };
+
+        let recv_us = worker_start.elapsed().as_micros() as u64;
+        let corrected = recv_us.saturating_sub(intended_us).max(1);
+        let uncorrected = recv_us.saturating_sub(actual_send_us).max(1);
+        res.histos.record(corrected, uncorrected);
+        res.completed += 1;
+
+        // Shift any pipelined-extra bytes to the front. Without pipelining
+        // buf_len == msg_len, so this is just a reset.
+        if buf_len > msg_len {
+            buf.copy_within(msg_len..buf_len, 0);
+            buf_len -= msg_len;
+        } else {
+            buf_len = 0;
+        }
+
         sched.advance();
     }
+
     res
 }
 
-fn build_client(spec: &RunSpec) -> anyhow::Result<Client> {
-    let builder = Client::builder()
-        .http1_only() // Match wrk2 (no h2 multiplexing).
-        .pool_max_idle_per_host(spec.connections * 2)
-        .timeout(spec.timeout);
-    let builder = if spec.keepalive {
-        builder.pool_idle_timeout(Some(Duration::from_secs(90)))
-    } else {
-        builder.pool_idle_timeout(Some(Duration::from_secs(0)))
-    };
-    Ok(builder.build()?)
+enum ReadResult {
+    Ok(usize), // bytes consumed (headers + body)
+    Timeout,
+    Err,
 }
 
-/// reqwest::Request is not Clone. For gate #1 (GET, no body) this is just
-/// method + url + headers.
-fn clone_request(r: &Request) -> Request {
-    let mut clone = Request::new(r.method().clone(), r.url().clone());
-    *clone.headers_mut() = r.headers().clone();
-    clone
+/// Read until exactly one complete HTTP/1.1 response is in `buf`. Returns the
+/// total byte count of that response, leaving any pipelined-extra bytes after
+/// that point. Content-Length only — chunked is not implemented (the mock
+/// uses Content-Length). Each call is bounded by `timeout`.
+async fn read_one_response(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    buf_len: &mut usize,
+    timeout: Duration,
+) -> ReadResult {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Try to parse what we already have. The borrow on `buf` ends when the
+        // match arm completes, freeing `buf` for the next read.
+        let parse_outcome: ParseOutcome = {
+            let mut headers = [httparse::EMPTY_HEADER; 32];
+            let mut resp = httparse::Response::new(&mut headers);
+            match resp.parse(&buf[..*buf_len]) {
+                Ok(httparse::Status::Complete(hdr_end)) => {
+                    let cl = resp
+                        .headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                        .and_then(|h| std::str::from_utf8(h.value).ok())
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let total = hdr_end + cl;
+                    if *buf_len >= total {
+                        ParseOutcome::Complete(total)
+                    } else {
+                        ParseOutcome::NeedMore
+                    }
+                }
+                Ok(httparse::Status::Partial) => ParseOutcome::NeedMore,
+                Err(_) => ParseOutcome::Bad,
+            }
+        };
+
+        match parse_outcome {
+            ParseOutcome::Complete(n) => return ReadResult::Ok(n),
+            ParseOutcome::Bad => return ReadResult::Err,
+            ParseOutcome::NeedMore => {}
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ReadResult::Timeout;
+        }
+        if *buf_len == buf.len() {
+            // Response larger than our buffer.
+            return ReadResult::Err;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut buf[*buf_len..])).await {
+            Ok(Ok(0)) => return ReadResult::Err, // EOF mid-response
+            Ok(Ok(n)) => *buf_len += n,
+            Ok(Err(_)) => return ReadResult::Err,
+            Err(_) => return ReadResult::Timeout,
+        }
+    }
+}
+
+enum ParseOutcome {
+    Complete(usize),
+    NeedMore,
+    Bad,
 }

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use reqwest::{Method, Url};
+use http::{Method, Uri};
 
 use engine::worker::RunSpec;
 
@@ -37,71 +37,96 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     timeout_s: u64,
 
-    /// Disable HTTP keepalive (default: on).
+    /// Disable HTTP keepalive (no-op in the hyper backend — kept for symmetry).
     #[arg(long)]
     no_keepalive: bool,
+
+    /// Tokio worker threads: 0 = auto (multi-thread, num_cpus), 1 = current-thread.
+    #[arg(long, default_value_t = 0)]
+    worker_threads: usize,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let spec = RunSpec {
-        url: Url::parse(&cli.url)?,
-        method: Method::from_bytes(cli.method.to_ascii_uppercase().as_bytes())?,
-        target_rps: cli.rate,
-        duration_s: cli.duration_s,
-        connections: cli.connections,
-        keepalive: !cli.no_keepalive,
-        timeout: Duration::from_secs(cli.timeout_s),
+    let rt = if cli.worker_threads == 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+    } else {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.enable_all();
+        if cli.worker_threads > 1 {
+            b.worker_threads(cli.worker_threads);
+        }
+        b.build()?
     };
 
-    eprintln!(
-        "engine-worker: {} {} @ {} rps for {}s, {} connections, keepalive={}",
-        spec.method, spec.url, spec.target_rps, spec.duration_s, spec.connections, spec.keepalive
-    );
+    rt.block_on(async move {
+        let spec = RunSpec {
+            url: Uri::try_from(cli.url.as_str())?,
+            method: Method::from_bytes(cli.method.to_ascii_uppercase().as_bytes())?,
+            target_rps: cli.rate,
+            duration_s: cli.duration_s,
+            connections: cli.connections,
+            keepalive: !cli.no_keepalive,
+            timeout: Duration::from_secs(cli.timeout_s),
+        };
 
-    let report = engine::run(spec).await?;
-
-    println!();
-    println!(
-        "  duration       {:>10.2}s",
-        report.elapsed_ms as f64 / 1000.0
-    );
-    println!(
-        "  requests       {:>10}    (achieved {:>7.1} req/s)",
-        report.completed, report.achieved_rps
-    );
-    if report.conn_errors + report.timeouts > 0 {
-        println!(
-            "  errors         conn={} timeout={}",
-            report.conn_errors, report.timeouts
+        eprintln!(
+            "engine-worker: {} {} @ {} rps for {}s, {} connections, threads={}",
+            spec.method,
+            spec.url,
+            spec.target_rps,
+            spec.duration_s,
+            spec.connections,
+            if cli.worker_threads == 0 { "auto".to_string() } else { cli.worker_threads.to_string() },
         );
-    }
-    println!();
-    println!("  Latency (corrected)   p50   p95    p99   p999    max");
-    println!(
-        "                     {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
-        ms(report.corrected.p50_us),
-        ms(report.corrected.p95_us),
-        ms(report.corrected.p99_us),
-        ms(report.corrected.p999_us),
-        ms(report.corrected.max_us),
-    );
-    println!("  Latency (uncorrected) p50   p95    p99   p999    max");
-    println!(
-        "                     {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
-        ms(report.uncorrected.p50_us),
-        ms(report.uncorrected.p95_us),
-        ms(report.uncorrected.p99_us),
-        ms(report.uncorrected.p999_us),
-        ms(report.uncorrected.max_us),
-    );
-    println!();
-    println!(
-        "  COO delta p99      {:+.1}ms  (corrected − uncorrected)",
-        (report.corrected.p99_us as f64 - report.uncorrected.p99_us as f64) / 1000.0
-    );
+
+        let report = engine::run(spec).await?;
+
+        println!();
+        println!(
+            "  duration       {:>10.2}s",
+            report.elapsed_ms as f64 / 1000.0
+        );
+        println!(
+            "  requests       {:>10}    (achieved {:>7.1} req/s)",
+            report.completed, report.achieved_rps
+        );
+        if report.conn_errors + report.timeouts > 0 {
+            println!(
+                "  errors         conn={} timeout={}",
+                report.conn_errors, report.timeouts
+            );
+        }
+        println!();
+        println!("  Latency (corrected)   p50   p95    p99   p999    max");
+        println!(
+            "                     {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
+            ms(report.corrected.p50_us),
+            ms(report.corrected.p95_us),
+            ms(report.corrected.p99_us),
+            ms(report.corrected.p999_us),
+            ms(report.corrected.max_us),
+        );
+        println!("  Latency (uncorrected) p50   p95    p99   p999    max");
+        println!(
+            "                     {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
+            ms(report.uncorrected.p50_us),
+            ms(report.uncorrected.p95_us),
+            ms(report.uncorrected.p99_us),
+            ms(report.uncorrected.p999_us),
+            ms(report.uncorrected.max_us),
+        );
+        println!();
+        println!(
+            "  COO delta p99      {:+.1}ms  (corrected − uncorrected)",
+            (report.corrected.p99_us as f64 - report.uncorrected.p99_us as f64) / 1000.0
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
+
     Ok(())
 }
 

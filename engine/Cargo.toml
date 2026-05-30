@@ -18,8 +18,9 @@ name = "engine-worker"
 path = "src/bin/worker.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "signal", "sync", "io-util"] }
+http = "1"
+httparse = "1"
 hdrhistogram = "7"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +32,4 @@ proptest = "1"
 tokio = { version = "1", features = ["full"] }
 mock = { path = "../mock" }
 axum = "0.8"
+http = "1"

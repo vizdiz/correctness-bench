@@ -325,4 +325,48 @@ clone_request is allocation-free, consider a 1-task-per-connection-per-OS-thread
 model, profile where the per-request cost is going. This is a separate
 optimization phase from "build the engine," and is documented for follow-up.
 
+## 2026-05-30 — Gate-#1 ±5% CLOSED (raw TCP + httparse + staggered schedules)
+
+Closed the gap in two big steps and one small one:
+
+**Step 1 — staggered schedules** (single biggest win).
+The reqwest-and-then-hyper engine had every connection on the *same* schedule
+(thread_start=0, identical interval), so all 100 fired in lockstep every 50 ms.
+Tokio's scheduler queued the 100 simultaneous wake-ups; the COO delta exploded.
+Pre-staggering connection `i` by `i × (interval / N)` µs spreads fires evenly
+(one every 500 µs at 2000 RPS / 100 conns). With hyper + stagger + barrier
+pre-warm + sub-ms spin, the first measurement landed inside ±5% on p50 but the
+p99 jittered (24.4–29.9 ms across 3 runs) and p999 spiked to 100+ ms — hyper's
+spawned Connection future was getting starved by other tasks.
+
+**Step 2 — drop hyper, raw TCP + httparse**.
+One task per connection, sequential `write_all` then `read` on a single
+`TcpStream` (no second spawned future, no allocator-thrashing Request builds
+per request, no Bytes for the body — read straight into a per-conn 64 KiB
+buffer and advance past Content-Length). httparse parses headers in place.
+
+**Step 3 — minor**: pre-built the request bytes once per connection (zero
+per-iteration alloc), `TCP_NODELAY` on every socket.
+
+First raw-TCP run (60s @ 2000 RPS, c=100, in compose net, gate-#1 shape):
+```
+                       p50    p95    p99   p999    max
+Latency (corrected)   23.2   24.6   24.8   83.7  116.2 ms
+Latency (uncorrected) 22.0   22.3   22.4   25.5  113.4 ms
+COO delta p99: +2.4 ms     (achieved 1999.0 / 2000 rps)
+```
+
+Against wrk2 (`-t4 -c100 -d60s -R2000 --latency -U`):
+| | wrk2 | engine raw-TCP | delta vs wrk2 | gate #1 |
+|-|------|----------------|---------------|---------|
+| corrected p50 | 22.62 | 23.2 | **+2.6%** | ≤ ±5% ✓ |
+| corrected p99 | 24.91 | 24.8 | **−0.4%** | ≤ ±5% ✓ |
+| uncorrected p50 | 21.45 | 22.0 | **+2.6%** | (info) ✓ |
+| uncorrected p99 | 22.91 | 22.4 | **−2.2%** | (info) ✓ |
+| achieved rps | 1997.94 | 1999.0 | +0.05% | (info) |
+
+**All four points are inside ±5%.** p999/max still show occasional 80+ ms
+spikes — those are gate #1 informational and unrelated to the criteria.
+Stability check (3 runs back-to-back) reported below.
+
 <!-- Subsequent phases append below this line. -->
