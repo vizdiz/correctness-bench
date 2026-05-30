@@ -35,6 +35,7 @@ async fn engine_hits_target_rps_against_healthy_mock() {
         connections: 20,
         keepalive: true,
         timeout: Duration::from_secs(5),
+        expected_status: vec![],
     };
 
     let report = run(spec).await.expect("run completed");
@@ -69,4 +70,40 @@ async fn engine_hits_target_rps_against_healthy_mock() {
     // Sanity: no connection errors / timeouts on the healthy mock.
     assert_eq!(report.conn_errors, 0, "unexpected conn errors");
     assert_eq!(report.timeouts, 0, "unexpected timeouts");
+
+    // Healthy mock returns 200 — every request should be a pass under the
+    // default any-2xx rule.
+    assert_eq!(report.pass, report.completed);
+    assert_eq!(report.fail_status, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_tier_assertion_catches_fast500() {
+    // Mock above cliff with pct=100 returns 500 on EVERY request. The engine's
+    // inline status-tier assertion must flag every one as fail_status.
+    let addr = spawn_mock().await;
+    let url = Uri::try_from(format!(
+        "http://{addr}/api?mode=fast500&cliff_rps=0&pct=100&base_latency_ms=1"
+    ))
+    .unwrap();
+
+    let spec = RunSpec {
+        url,
+        method: Method::GET,
+        target_rps: 200.0,
+        duration_s: 3,
+        connections: 10,
+        keepalive: true,
+        timeout: Duration::from_secs(3),
+        expected_status: vec![200],
+    };
+
+    let report = run(spec).await.expect("run completed");
+
+    assert!(report.completed >= 500, "expected >= 500 completions, got {}", report.completed);
+    assert_eq!(report.pass, 0, "no requests should pass against fast500 above cliff");
+    assert_eq!(
+        report.fail_status, report.completed,
+        "every completed request should be classified fail_status"
+    );
 }

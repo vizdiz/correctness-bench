@@ -392,4 +392,41 @@ p99 variance across runs: max(24.9) − min(24.6) = 0.3 ms = **1.2%** (gate #1 r
 histograms, and request-issuance overhead all agree with wrk2 within tolerance.
 Nothing downstream is blocked anymore.
 
+## 2026-05-30 — Engine inline status-tier assertions (gate #2 status tier)
+
+Added the inline status-tier assertion to the worker (per
+.claude/agents/engine.md "inline assertions, RPS-bucketed"). bench.proto
+`AssertSpec.expected_status` semantics: empty = any 2xx is pass; non-empty =
+status must be in the list. httparse already parses the response status code,
+so the addition is essentially free per request — classify and increment a
+counter.
+
+cargo test green: new integration test `status_tier_assertion_catches_fast500`
+hits the mock above cliff with pct=100 and asserts every response is
+`fail_status`.
+
+Live gate-#2 oracle check at the cliff (mock fast500 cliff_rps=100):
+
+| target rate | pct | expected | engine reported | latency p50 corrected |
+|------------:|----:|---------:|----------------:|----------------------:|
+| 50 rps (below cliff) | 100 | ~100% pass | **100.0% pass (1000/1000)** ✓ | 25.1 ms |
+| 200 rps (above cliff) | 100 | ~100% fail_status (within ±2%) | **97.5% fail_status (3900/4000)** | 23.8 ms |
+| 200 rps (above cliff) | 50 | ~50% fail_status | **50.0% fail_status (2000/4000)** ✓ exact | 24.5 ms |
+
+- Below-cliff pass rate hits 100.0% exactly.
+- pct=50 lands at exactly 50.0% — the mock's deterministic `seq % 100 < pct`
+  selection translates directly through the engine's classification.
+- Above-cliff at pct=100 reports 97.5% fail rather than 100% because the mock's
+  rolling-1s RPS meter takes the first ~1 s to climb above cliff; those first
+  ~100 requests are below-cliff (healthy) by the mock's own measurement, not
+  an engine error. Matches the mock contract.
+
+**Latency stays at ~22 ms uncorrected p50 across all three** — flat across
+the cliff while correctness cliffs from 100% → 50% → 2.5%. **The headline
+"latency flat, correctness cliffs" is now empirically demonstrated end-to-end.**
+
+What's NOT done yet: per-RPS-bucket aggregation (the correctness-vs-load
+curve). For a fixed-rate test it'd be a single bucket; useful once we add
+ramping or run the engine at multiple rates and stitch. Tracked.
+
 <!-- Subsequent phases append below this line. -->

@@ -41,6 +41,10 @@ pub struct RunSpec {
     pub keepalive: bool,
     pub connections: usize,
     pub timeout: Duration,
+    /// Inline status-tier assertion (bench.proto AssertSpec.expected_status
+    /// semantics): empty = any 2xx is pass; non-empty = status must be in the
+    /// list to be pass. Anything else is `fail_status`.
+    pub expected_status: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -50,6 +54,8 @@ pub struct RunReport {
     pub histos: Histos,
     pub achieved_rps: f64,
     pub completed: u64,
+    pub pass: u64,
+    pub fail_status: u64,
     pub conn_errors: u64,
     pub timeouts: u64,
     pub corrected: Summary,
@@ -60,8 +66,19 @@ pub struct RunReport {
 struct ConnResult {
     histos: Histos,
     completed: u64,
+    pass: u64,
+    fail_status: u64,
     conn_errors: u64,
     timeouts: u64,
+}
+
+/// Classify a response per bench.proto's AssertSpec.expected_status semantics.
+fn is_pass(status: u16, expected: &[u16]) -> bool {
+    if expected.is_empty() {
+        (200..300).contains(&status)
+    } else {
+        expected.contains(&status)
+    }
 }
 
 /// Tail-wait threshold: above this we sleep, below we spin. With staggered
@@ -113,16 +130,18 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
         tokio::sync::watch::channel::<Option<Instant>>(None);
     let timeout = spec.timeout;
 
+    let expected_status = Arc::new(spec.expected_status.clone());
     let mut joinset: JoinSet<ConnResult> = JoinSet::new();
     for conn_id in 0..spec.connections {
         let host = host.clone();
         let barrier = barrier.clone();
         let req_bytes = req_bytes.clone();
+        let expected_status = expected_status.clone();
         let mut rx = worker_start_rx_template.clone();
         let offset_us = conn_id as u64 * stagger_us;
         joinset.spawn(async move {
             connection_task(
-                host, port, req_bytes, per_conn_throughput_us, offset_us,
+                host, port, req_bytes, expected_status, per_conn_throughput_us, offset_us,
                 spec.duration_s, timeout, barrier, &mut rx,
             )
             .await
@@ -137,12 +156,16 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
     let mut conn_errors = 0u64;
     let mut timeouts = 0u64;
     let mut total_completed = 0u64;
+    let mut total_pass = 0u64;
+    let mut total_fail_status = 0u64;
     while let Some(joined) = joinset.join_next().await {
         let res = joined.context("connection task panicked")?;
         merged.merge(&res.histos);
         conn_errors += res.conn_errors;
         timeouts += res.timeouts;
         total_completed += res.completed;
+        total_pass += res.pass;
+        total_fail_status += res.fail_status;
     }
 
     let elapsed = worker_start.elapsed();
@@ -156,6 +179,8 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
         histos: merged,
         achieved_rps,
         completed: total_completed,
+        pass: total_pass,
+        fail_status: total_fail_status,
         conn_errors,
         timeouts,
         corrected,
@@ -168,6 +193,7 @@ async fn connection_task(
     host: String,
     port: u16,
     req_bytes: Arc<Vec<u8>>,
+    expected_status: Arc<Vec<u16>>,
     throughput_us: f64,
     offset_us: u64,
     duration_s: u64,
@@ -238,23 +264,29 @@ async fn connection_task(
         }
 
         // Read until we have a complete response (headers + body).
-        let msg_len = match read_one_response(&mut stream, &mut buf, &mut buf_len, timeout).await {
-            ReadResult::Ok(n) => n,
-            ReadResult::Timeout => {
-                res.timeouts += 1;
-                break;
-            }
-            ReadResult::Err => {
-                res.conn_errors += 1;
-                break;
-            }
-        };
+        let (msg_len, status) =
+            match read_one_response(&mut stream, &mut buf, &mut buf_len, timeout).await {
+                ReadResult::Ok { msg_len, status } => (msg_len, status),
+                ReadResult::Timeout => {
+                    res.timeouts += 1;
+                    break;
+                }
+                ReadResult::Err => {
+                    res.conn_errors += 1;
+                    break;
+                }
+            };
 
         let recv_us = worker_start.elapsed().as_micros() as u64;
         let corrected = recv_us.saturating_sub(intended_us).max(1);
         let uncorrected = recv_us.saturating_sub(actual_send_us).max(1);
         res.histos.record(corrected, uncorrected);
         res.completed += 1;
+        if is_pass(status, &expected_status) {
+            res.pass += 1;
+        } else {
+            res.fail_status += 1;
+        }
 
         // Shift any pipelined-extra bytes to the front. Without pipelining
         // buf_len == msg_len, so this is just a reset.
@@ -272,7 +304,7 @@ async fn connection_task(
 }
 
 enum ReadResult {
-    Ok(usize), // bytes consumed (headers + body)
+    Ok { msg_len: usize, status: u16 },
     Timeout,
     Err,
 }
@@ -304,8 +336,9 @@ async fn read_one_response(
                         .and_then(|s| s.trim().parse::<usize>().ok())
                         .unwrap_or(0);
                     let total = hdr_end + cl;
+                    let status = resp.code.unwrap_or(0);
                     if *buf_len >= total {
-                        ParseOutcome::Complete(total)
+                        ParseOutcome::Complete { msg_len: total, status }
                     } else {
                         ParseOutcome::NeedMore
                     }
@@ -316,7 +349,9 @@ async fn read_one_response(
         };
 
         match parse_outcome {
-            ParseOutcome::Complete(n) => return ReadResult::Ok(n),
+            ParseOutcome::Complete { msg_len, status } => {
+                return ReadResult::Ok { msg_len, status }
+            }
             ParseOutcome::Bad => return ReadResult::Err,
             ParseOutcome::NeedMore => {}
         }
@@ -339,7 +374,7 @@ async fn read_one_response(
 }
 
 enum ParseOutcome {
-    Complete(usize),
+    Complete { msg_len: usize, status: u16 },
     NeedMore,
     Bad,
 }

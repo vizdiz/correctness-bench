@@ -44,6 +44,11 @@ struct Cli {
     /// Tokio worker threads: 0 = auto (multi-thread, num_cpus), 1 = current-thread.
     #[arg(long, default_value_t = 0)]
     worker_threads: usize,
+
+    /// Inline status-tier assertion. Empty (default) means "any 2xx is pass."
+    /// Repeat to allow multiple, e.g. `--expected-status 200 --expected-status 204`.
+    #[arg(long)]
+    expected_status: Vec<u16>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,6 +76,7 @@ fn main() -> anyhow::Result<()> {
             connections: cli.connections,
             keepalive: !cli.no_keepalive,
             timeout: Duration::from_secs(cli.timeout_s),
+            expected_status: cli.expected_status.clone(),
         };
 
         eprintln!(
@@ -123,6 +129,27 @@ fn main() -> anyhow::Result<()> {
         println!(
             "  COO delta p99      {:+.1}ms  (corrected − uncorrected)",
             (report.corrected.p99_us as f64 - report.uncorrected.p99_us as f64) / 1000.0
+        );
+        println!();
+        let pass_rate = if report.completed > 0 {
+            report.pass as f64 / report.completed as f64 * 100.0
+        } else {
+            0.0
+        };
+        let expected_label = if report.spec.expected_status.is_empty() {
+            "any 2xx".to_string()
+        } else {
+            report
+                .spec
+                .expected_status
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        println!(
+            "  Correctness        {} / {} pass  ({:.1}%)  fail_status={}  (expected: {})",
+            report.pass, report.completed, pass_rate, report.fail_status, expected_label
         );
         Ok::<_, anyhow::Error>(())
     })?;
