@@ -69,6 +69,17 @@ export interface ListRunsResponse {
   next_cursor: string | null
 }
 
+// Live SSE tick event from /v1/runs/:id/stream. Shape mirrors engine's Tick.
+// Will grow toward api.md SSE tick shape (percentiles, buckets) as engine adds.
+export interface Tick {
+  elapsed_s: number
+  achieved_rps_1s: number
+  completed_total: number
+  pass_total: number
+  fail_status_total: number
+  ts?: string
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string; field?: string; request_id: string }
 }

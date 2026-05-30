@@ -13,21 +13,23 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/vizdiz/correctness-bench/control/internal/sse"
 	"github.com/vizdiz/correctness-bench/control/internal/store"
 )
 
 // Server holds handler dependencies. The logger is deliberately only ever given
 // non-secret fields — target headers and bodies never pass through it.
 type Server struct {
-	Store *store.Store
-	Log   *slog.Logger
+	Store  *store.Store
+	Log    *slog.Logger
+	Broker *sse.Broker
 }
 
 func NewServer(s *store.Store, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{Store: s, Log: log}
+	return &Server{Store: s, Log: log, Broker: sse.NewBroker()}
 }
 
 const maxBodyBytes = 1 << 20 // 1 MiB cap on the POST /v1/runs JSON

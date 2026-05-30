@@ -1,26 +1,87 @@
-// Package sse will carry the live run stream (tick/status/done events) per
-// contracts/api.md GET /v1/runs/{id}/stream.
+// Package sse holds the in-memory tick broker that bridges engine workers
+// (push side: POST /v1/_internal/runs/:id/tick) to web/CLI subscribers
+// (pull side: GET /v1/runs/:id/stream as Server-Sent Events).
 //
-// SCAFFOLD ONLY. The streaming implementation depends on real engine data
-// flowing through the coordinator and is intentionally not built yet (see
-// docs/PLAN.md C.2). The Broker below documents the intended shape so the
-// dependency and event types are pinned, but no endpoint is wired to it.
+// This is the v0 transport. The frozen contract for worker↔coordinator is
+// `contracts/bench.proto` (gRPC) — once the engine speaks bench.proto to a
+// real coordinator, the coordinator forwards into this same broker; the SSE
+// surface to web/CLI does not change.
 package sse
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
-// Event is one SSE message. Each carries an id (the tick number) so clients can
-// resume with Last-Event-ID.
-type Event struct {
-	ID   uint64 // tick number; used as the SSE `id:` field
-	Type string // "tick" | "status" | "warning" | "done"
-	Data []byte // JSON payload
-	TS   time.Time
+// Tick is what engine workers push. Shape is a subset of api.md's SSE tick
+// event so that growing fields toward full api.md parity is additive.
+type Tick struct {
+	ElapsedS        uint64    `json:"elapsed_s"`
+	AchievedRps1S   float64   `json:"achieved_rps_1s"`
+	CompletedTotal  uint64    `json:"completed_total"`
+	PassTotal       uint64    `json:"pass_total"`
+	FailStatusTotal uint64    `json:"fail_status_total"`
+	TS              time.Time `json:"ts,omitempty"` // server-stamped on ingest
 }
 
-// Broker will fan run events out to connected SSE clients with a short replay
-// buffer (>=30s) for Last-Event-ID resume. Not implemented yet.
-type Broker struct{}
+// Broker fans run-scoped Ticks out to N concurrent subscribers per run.
+// Subscriber channels are buffered; a slow subscriber drops missed ticks
+// rather than back-pressuring the publisher (the hard rule: a slow consumer
+// must never stall the data path).
+type Broker struct {
+	mu   sync.RWMutex
+	subs map[string][]chan Tick
+}
 
-// TODO(phase: engine-integration): implement Subscribe/Publish + replay buffer
-// once the coordinator streams merged ticks into the control plane.
+func NewBroker() *Broker {
+	return &Broker{subs: make(map[string][]chan Tick)}
+}
+
+const subBuffer = 16
+
+// Subscribe returns a channel that receives all ticks published for runID
+// from this point forward, plus a cleanup func the caller must defer.
+func (b *Broker) Subscribe(runID string) (<-chan Tick, func()) {
+	ch := make(chan Tick, subBuffer)
+	b.mu.Lock()
+	b.subs[runID] = append(b.subs[runID], ch)
+	b.mu.Unlock()
+	cleanup := func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		list := b.subs[runID]
+		for i, c := range list {
+			if c == ch {
+				b.subs[runID] = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+		if len(b.subs[runID]) == 0 {
+			delete(b.subs, runID)
+		}
+		close(ch)
+	}
+	return ch, cleanup
+}
+
+// Publish delivers tick to every current subscriber of runID. Slow subscribers
+// (full buffer) drop the tick rather than blocking.
+func (b *Broker) Publish(runID string, t Tick) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, ch := range b.subs[runID] {
+		select {
+		case ch <- t:
+		default:
+			// drop — never block the publisher
+		}
+	}
+}
+
+// SubscriberCount returns the number of active subscribers for runID. Useful
+// for tests and (eventually) telemetry.
+func (b *Broker) SubscriberCount(runID string) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subs[runID])
+}

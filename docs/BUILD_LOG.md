@@ -429,4 +429,58 @@ What's NOT done yet: per-RPS-bucket aggregation (the correctness-vs-load
 curve). For a fixed-rate test it'd be a single bucket; useful once we add
 ramping or run the engine at multiple rates and stitch. Tracked.
 
+## 2026-05-30 — Live data flowing: engine → control → SSE → web
+
+End-to-end live tick pipeline wired and verified by curl through every layer.
+
+**Control plane.** New `internal/sse` package: `Broker` fans run-scoped Ticks to
+N subscribers per run with bounded-buffer drop-on-slow semantics (the data path
+never back-pressures). Two new endpoints in `internal/api`:
+- `POST /v1/_internal/runs/{id}/tick` — v0 ingest from engine workers. Not
+  part of the public api.md surface; the bench.proto coordinator will replace
+  it once built.
+- `GET /v1/runs/{id}/stream` — the api.md SSE endpoint. Sets the right headers
+  (`text/event-stream`, no-cache, no-buffering), subscribes via the broker,
+  emits `event: tick` + `id: <elapsed_s>` + `data: <json>`. Sends a `keepalive`
+  comment every 15 s so intermediate proxies don't reap the connection.
+
+**Engine.** `engine::run_with_ticks(spec, Option<mpsc::Sender<Tick>>)` exposes
+the 1 Hz tick stream. CLI gets `--push-to <base url>` and `--run-id <uuid>`;
+each tick is POSTed to `{base}/v1/_internal/runs/{run_id}/tick` (1 Hz, off the
+hot path — reqwest is fine here).
+
+**Web.** RunDetail subscribes to `/v1/runs/:id/stream` via `EventSource` (the
+vite dev proxy forwards SSE without buffering). Stat strip switches from
+placeholder to live values: achieved RPS, pass rate, completed count. Sparklines
+render the per-tick series. A `live` / `idle` indicator next to the status badge
+shows SSE state.
+
+**Curl-verified path** (engine in compose net → control → SSE consumer):
+```
+$ RUN_ID=$(curl POST /v1/runs ... | jq -r .run_id)
+$ curl -N http://control:8000/v1/runs/$RUN_ID/stream &
+$ docker run engine ... --push-to http://control:8000 --run-id $RUN_ID
+...
+  Correctness  100 / 1200 pass (8.3%)  fail_status=1100
+
+=== SSE consumer received ===
+event: tick   data: {"elapsed_s":1,"achieved_rps_1s":196,"completed_total":196,"pass_total":100,"fail_status_total":96}
+event: tick   data: {"elapsed_s":2,"achieved_rps_1s":200,"completed_total":396,"pass_total":100,"fail_status_total":296}
+...
+event: tick   data: {"elapsed_s":6,"achieved_rps_1s":200,"completed_total":1196,"pass_total":100,"fail_status_total":1096}
+```
+
+**Via the web's vite proxy (port 5173)** — same payload, same headers. The
+browser path `http://localhost:5173 → vite → control:8000` works for SSE.
+
+Web build (`npm run build`) green; type-check passes. The actual rendered
+chart in a real browser is still unconfirmed this session (no browser/display)
+— wiring + data shape are confirmed end-to-end via curl.
+
+What's NOT yet there: per-RPS bucketed correctness (the canonical cliff curve;
+needs ramping or multi-rate aggregation), api.md SSE tick shape (we ship the
+engine-Tick subset), tick persistence to `run_ticks`, SSE resume via
+`Last-Event-ID`. All clearly enumerated in the api.md frozen contract; this
+v0 transport is shape-compatible enough to grow into it.
+
 <!-- Subsequent phases append below this line. -->

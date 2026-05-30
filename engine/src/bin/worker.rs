@@ -54,6 +54,15 @@ struct Cli {
     /// achieved_rps_1s, completed_total, pass_total, fail_status_total.
     #[arg(long)]
     ticks: bool,
+
+    /// Control plane base URL (e.g. http://control:8000). When set together
+    /// with --run-id, each tick is POSTed to {url}/v1/_internal/runs/{id}/tick.
+    #[arg(long)]
+    push_to: Option<String>,
+
+    /// Run UUID to push ticks against. Must be paired with --push-to.
+    #[arg(long)]
+    run_id: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -94,14 +103,31 @@ fn main() -> anyhow::Result<()> {
             if cli.worker_threads == 0 { "auto".to_string() } else { cli.worker_threads.to_string() },
         );
 
-        // Optional live tick channel. If --ticks, spawn a printer task that
-        // emits one JSON line per tick to stdout.
-        let tick_tx = if cli.ticks {
+        // Optional live tick channel. Wired when either --ticks (print JSON to
+        // stdout) or --push-to + --run-id (POST each tick to control) is set.
+        let push_url = match (cli.push_to.as_deref(), cli.run_id.as_deref()) {
+            (Some(base), Some(rid)) => Some(format!(
+                "{}/v1/_internal/runs/{}/tick",
+                base.trim_end_matches('/'),
+                rid
+            )),
+            _ => None,
+        };
+        let want_ticks = cli.ticks || push_url.is_some();
+        let tick_tx = if want_ticks {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<engine::Tick>();
+            let print_json = cli.ticks;
+            let http = push_url.as_ref().map(|_| reqwest::Client::new());
+            let push_url = push_url.clone();
             tokio::spawn(async move {
                 while let Some(tick) = rx.recv().await {
-                    if let Ok(line) = serde_json::to_string(&tick) {
-                        println!("{line}");
+                    if print_json {
+                        if let Ok(line) = serde_json::to_string(&tick) {
+                            println!("{line}");
+                        }
+                    }
+                    if let (Some(url), Some(client)) = (&push_url, &http) {
+                        let _ = client.post(url).json(&tick).send().await;
                     }
                 }
             });
