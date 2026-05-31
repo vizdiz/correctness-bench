@@ -1,12 +1,22 @@
 [package]
 name = "bench-cli"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Thin client of the control plane. NOT a load generator of its own.
-# Built LATE (see .claude/agents/cli.md). Stub only during scaffolding.
+# Thin client of the control plane (`contracts/api.md`). NOT a load generator
+# of its own — POSTs /v1/runs, subscribes /v1/runs/:id/stream via SSE, prints
+# a live per-second dashboard, exits when the run's duration elapses.
 
 [[bin]]
 name = "bench"
 path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
