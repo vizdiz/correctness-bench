@@ -11,6 +11,16 @@
 //! This module is pure (no async, no clock — `now_us` is an argument), so it
 //! can be exhaustively unit-tested and property-tested.
 
+/// Rate-shape of the schedule. Constant is the gate-#1 mode (wrk2-equivalent);
+/// Ramp linearly accelerates 0 → peak over `duration_us`, the intended-send
+/// timing inverts the cumulative count integral `N(t) = R·t²/(2·D)` →
+/// `t(N) = sqrt(2·D·N/R)`.
+#[derive(Debug, Clone, Copy)]
+pub enum RateSchedule {
+    Constant { throughput_us: f64 },
+    Ramp { duration_us: u64, peak_throughput_us: f64 },
+}
+
 /// Per-connection scheduling state. One per connection task.
 #[derive(Debug, Clone)]
 pub struct ConnSched {
@@ -20,10 +30,12 @@ pub struct ConnSched {
     /// Number of completed responses on this connection — the index that
     /// defines each request's intended send slot.
     pub complete: u64,
-    /// Original schedule throughput (requests per microsecond).
-    pub throughput_us: f64,
+    /// Rate-shape of the schedule (Constant or Ramp).
+    pub schedule: RateSchedule,
     /// Catch-up rate — wrk2 hardcodes 2× throughput. Stored explicitly so a
-    /// future tuner can probe other values; gate #1 needs 2×.
+    /// future tuner can probe other values; gate #1 needs 2×. Only meaningful
+    /// for Constant — Ramp's instantaneous rate makes the wrk2 catch-up trick
+    /// awkward; behind-on-Ramp simply fires immediately.
     pub catch_up_us: f64,
     /// True when we're on or ahead of the original schedule. Transitions
     /// false → true on each "we re-caught up" cycle, anchoring catch-up windows.
@@ -36,15 +48,27 @@ pub struct ConnSched {
 }
 
 impl ConnSched {
-    /// `throughput_us` is requests per microsecond. `thread_start_us` is the
-    /// shared epoch. Catch-up rate is wrk2's 2× (do not change without invalidating
-    /// gate #1 agreement).
+    /// Constant-rate schedule (the gate-#1 mode). Catch-up rate is wrk2's 2×
+    /// (do not change without invalidating gate #1 agreement).
     pub fn new(thread_start_us: u64, throughput_us: f64) -> Self {
         Self {
             thread_start_us,
             complete: 0,
-            throughput_us,
+            schedule: RateSchedule::Constant { throughput_us },
             catch_up_us: throughput_us * 2.0,
+            caught_up: true,
+            catch_up_start_time: 0,
+            complete_at_catch_up_start: 0,
+        }
+    }
+
+    /// Linear ramp 0 → peak_throughput_us over duration_us.
+    pub fn ramp(thread_start_us: u64, duration_us: u64, peak_throughput_us: f64) -> Self {
+        Self {
+            thread_start_us,
+            complete: 0,
+            schedule: RateSchedule::Ramp { duration_us, peak_throughput_us },
+            catch_up_us: 0.0,
             caught_up: true,
             catch_up_start_time: 0,
             complete_at_catch_up_start: 0,
@@ -56,11 +80,23 @@ impl ConnSched {
     /// against, and it is computed from the ORIGINAL schedule — catch-up never
     /// changes how we measure, only how we pace.
     pub fn intended_send_time(&self) -> u64 {
-        self.thread_start_us + (self.complete as f64 / self.throughput_us) as u64
+        match self.schedule {
+            RateSchedule::Constant { throughput_us } => {
+                self.thread_start_us + (self.complete as f64 / throughput_us) as u64
+            }
+            RateSchedule::Ramp { duration_us, peak_throughput_us } => {
+                let n = self.complete as f64;
+                let t_us =
+                    (2.0 * duration_us as f64 * n / peak_throughput_us).sqrt() as u64;
+                self.thread_start_us + t_us
+            }
+        }
     }
 
     /// Microseconds the caller should sleep before firing the next request. 0
-    /// means "fire now." Port of `usec_to_next_send` in giltene/wrk2 wrk.c.
+    /// means "fire now." For Constant, ports wrk2's `usec_to_next_send`
+    /// catch-up-at-2× behavior. For Ramp, fires immediately when behind (no
+    /// catch-up bump — the instantaneous rate already changes with time).
     pub fn usec_to_next_send(&mut self, now_us: u64) -> u64 {
         let next_start_orig = self.intended_send_time();
 
@@ -71,7 +107,14 @@ impl ConnSched {
             return next_start_orig - now_us;
         }
 
-        // We are behind.
+        // Behind.
+        if matches!(self.schedule, RateSchedule::Ramp { .. }) {
+            // Ramp has no catch-up bump — fire immediately.
+            self.caught_up = false;
+            return 0;
+        }
+
+        // Constant + behind: wrk2 catch-up at 2×.
         if self.caught_up {
             self.caught_up = false;
             self.catch_up_start_time = now_us;
@@ -167,5 +210,36 @@ mod tests {
             assert!(now >= prev, "intended-send-time went backwards");
             prev = now;
         }
+    }
+
+    /// Ramp's first request fires immediately (n=0 → t=0); subsequent intended
+    /// times follow the sqrt curve. After N(D)=R·D/2 requests, intended time
+    /// equals D (the run end). Verified at 1000 RPS peak over 1 s.
+    #[test]
+    fn ramp_intended_times_match_inverse_integral() {
+        // Peak 1000 RPS for 1s → 500 expected requests; intended time at the
+        // 500th matches D (1 000 000 µs) to within rounding.
+        let mut s = ConnSched::ramp(0, 1_000_000, 0.001);
+        assert_eq!(s.intended_send_time(), 0, "n=0 fires at the start");
+        let mut prev = 0u64;
+        for _ in 0..500 {
+            s.advance();
+            let t = s.intended_send_time();
+            assert!(t >= prev, "ramp intended time regressed: {} < {}", t, prev);
+            prev = t;
+        }
+        // At complete=500, t = sqrt(2·1e6·500/0.001) ≈ 1e6.
+        let t_end = s.intended_send_time();
+        assert!(t_end >= 990_000 && t_end <= 1_010_000, "ramp end time = {}", t_end);
+    }
+
+    /// Ramp doesn't engage wrk2-style catch-up. Behind on ramp → fire immediately.
+    #[test]
+    fn ramp_fires_immediately_when_behind() {
+        let mut s = ConnSched::ramp(0, 1_000_000, 0.001);
+        s.advance(); // n=1, intended around sqrt(2e9) ≈ 44721 µs
+        let wait = s.usec_to_next_send(1_000_000);
+        assert_eq!(wait, 0); // far behind, fire now
+        assert!(!s.caught_up);
     }
 }

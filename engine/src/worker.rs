@@ -18,7 +18,7 @@
 //! measurements (wrk2 is 22.6 ms).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -30,12 +30,14 @@ use tokio::sync::{mpsc, Barrier};
 use tokio::task::JoinSet;
 
 use crate::hist::{Histos, Summary};
-use crate::sched::ConnSched;
+use crate::sched::{ConnSched, RateSchedule};
 
 #[derive(Debug, Clone)]
 pub struct RunSpec {
     pub url: Uri,
     pub method: Method,
+    /// Target requests per second. With `ramp = true` this is the PEAK; the
+    /// schedule linearly ramps from 0 to this value over `duration_s`.
     pub target_rps: f64,
     pub duration_s: u64,
     /// Unused in the raw-TCP backend (we always keep the same TcpStream open
@@ -47,6 +49,9 @@ pub struct RunSpec {
     /// semantics): empty = any 2xx is pass; non-empty = status must be in the
     /// list to be pass. Anything else is `fail_status`.
     pub expected_status: Vec<u16>,
+    /// When true, ramp the offered rate linearly from 0 to `target_rps` over
+    /// `duration_s`. Reveals the full cliff curve in a single run.
+    pub ramp: bool,
 }
 
 #[derive(Debug)]
@@ -66,7 +71,6 @@ pub struct RunReport {
 
 #[derive(Default)]
 struct ConnResult {
-    histos: Histos,
     completed: u64,
     pass: u64,
     fail_status: u64,
@@ -107,6 +111,12 @@ pub struct Tick {
     /// api.md's `this_tick` nested object. Per-tick pass rate
     /// (`this_tick.pass / this_tick.total`) is the per-second cliff.
     pub this_tick: ThisTick,
+    /// Running corrected percentiles as of this tick.
+    pub percentiles_so_far: PercentilesSoFar,
+    /// Per-RPS correctness buckets attributable to this tick. One entry today
+    /// (the bucket containing `achieved_rps_1s`); clients accumulate across
+    /// ticks to plot correctness-vs-load.
+    pub buckets: Vec<Bucket>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +125,30 @@ pub struct ThisTick {
     pub pass: u64,
     pub fail_status: u64,
 }
+
+/// Running-percentile snapshot. api.md SSE tick names this
+/// `percentiles_so_far`. We carry corrected p50/p99 (the gate-#1 numbers).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PercentilesSoFar {
+    pub p50_us: u64,
+    pub p99_us: u64,
+}
+
+/// One per-RPS bucket worth of correctness counts. Matches the api.md SSE
+/// tick `buckets` entry shape. For now each tick carries exactly one bucket
+/// (the bucket the tick's measured RPS fell into); clients aggregate across
+/// many ticks to build the cliff curve.
+#[derive(Debug, Clone, Serialize)]
+pub struct Bucket {
+    pub rps_lo: f64,
+    pub rps_hi: f64,
+    pub total: u64,
+    pub pass: u64,
+    pub fail_status: u64,
+}
+
+/// Bucket width on the offered-RPS axis. 10 RPS matches the api.md example.
+const BUCKET_WIDTH_RPS: f64 = 10.0;
 
 /// Tail-wait threshold: above this we sleep, below we spin. With staggered
 /// schedules the runtime rarely has more than one task spinning at a time, so
@@ -160,6 +194,18 @@ pub async fn run_with_ticks(
 
     let per_conn_rps = spec.target_rps / spec.connections as f64;
     let per_conn_throughput_us = per_conn_rps / 1_000_000.0;
+    // Per-conn schedule. For ramp, `target_rps` is the peak; intended-send
+    // times follow t(n) = sqrt(2·D·n/R).
+    let per_conn_schedule = if spec.ramp {
+        RateSchedule::Ramp {
+            duration_us: spec.duration_s.saturating_mul(1_000_000),
+            peak_throughput_us: per_conn_throughput_us,
+        }
+    } else {
+        RateSchedule::Constant { throughput_us: per_conn_throughput_us }
+    };
+    // Stagger uses the PEAK per-conn interval (same as target for Constant),
+    // so wake-ups stay spread late in a ramp.
     let per_conn_interval_us = (1_000_000.0 / per_conn_rps) as u64;
     let stagger_us = per_conn_interval_us / spec.connections.max(1) as u64;
 
@@ -179,6 +225,11 @@ pub async fn run_with_ticks(
 
     let expected_status = Arc::new(spec.expected_status.clone());
     let counters = Arc::new(LiveCounters::default());
+    // Shared corrected/uncorrected histograms — all conn tasks lock briefly to
+    // record. At 2000 RPS aggregate the per-lock cost is microseconds/sec total,
+    // and centralizing lets the tick task and final report read the same source
+    // of truth without a per-task merge step.
+    let histos = Arc::new(Mutex::new(Histos::new()));
 
     let mut joinset: JoinSet<ConnResult> = JoinSet::new();
     for conn_id in 0..spec.connections {
@@ -187,12 +238,13 @@ pub async fn run_with_ticks(
         let req_bytes = req_bytes.clone();
         let expected_status = expected_status.clone();
         let counters = counters.clone();
+        let histos = histos.clone();
         let mut rx = worker_start_rx_template.clone();
         let offset_us = conn_id as u64 * stagger_us;
         joinset.spawn(async move {
             connection_task(
-                host, port, req_bytes, expected_status, counters,
-                per_conn_throughput_us, offset_us,
+                host, port, req_bytes, expected_status, counters, histos,
+                per_conn_schedule, offset_us,
                 spec.duration_s, timeout, barrier, &mut rx,
             )
             .await
@@ -207,6 +259,7 @@ pub async fn run_with_ticks(
     // when the run deadline passes or when the sender is dropped.
     let tick_handle = tick_tx.map(|tx| {
         let counters = counters.clone();
+        let histos = histos.clone();
         let duration_s = spec.duration_s;
         tokio::spawn(async move {
             let mut prev_completed = 0u64;
@@ -229,6 +282,28 @@ pub async fn run_with_ticks(
                 prev_completed = c;
                 prev_pass = p;
                 prev_fail_status = f;
+
+                // Snapshot percentiles under the lock. Brief — value_at_quantile
+                // is O(buckets) but bounded by HDR's structure (~hundreds).
+                let percentiles_so_far = {
+                    let h = histos.lock().unwrap();
+                    PercentilesSoFar {
+                        p50_us: h.corrected.value_at_quantile(0.5),
+                        p99_us: h.corrected.value_at_quantile(0.99),
+                    }
+                };
+
+                // Bucket this tick onto the offered-RPS axis. Clients sum
+                // matching-edge entries across ticks to build the cliff curve.
+                let rps_lo = (achieved_rps_1s / BUCKET_WIDTH_RPS).floor() * BUCKET_WIDTH_RPS;
+                let bucket = Bucket {
+                    rps_lo,
+                    rps_hi: rps_lo + BUCKET_WIDTH_RPS,
+                    total: this_tick.total,
+                    pass: this_tick.pass,
+                    fail_status: this_tick.fail_status,
+                };
+
                 if tx
                     .send(Tick {
                         elapsed_s,
@@ -237,6 +312,8 @@ pub async fn run_with_ticks(
                         pass_total: p,
                         fail_status_total: f,
                         this_tick,
+                        percentiles_so_far,
+                        buckets: vec![bucket],
                     })
                     .is_err()
                 {
@@ -246,7 +323,6 @@ pub async fn run_with_ticks(
         })
     });
 
-    let mut merged = Histos::new();
     let mut conn_errors = 0u64;
     let mut timeouts = 0u64;
     let mut total_completed = 0u64;
@@ -254,7 +330,6 @@ pub async fn run_with_ticks(
     let mut total_fail_status = 0u64;
     while let Some(joined) = joinset.join_next().await {
         let res = joined.context("connection task panicked")?;
-        merged.merge(&res.histos);
         conn_errors += res.conn_errors;
         timeouts += res.timeouts;
         total_completed += res.completed;
@@ -266,6 +341,8 @@ pub async fn run_with_ticks(
         h.abort();
     }
 
+    // Histos are already merged in-place (shared mutex); snapshot for the report.
+    let merged = histos.lock().unwrap().clone();
     let elapsed = worker_start.elapsed();
     let achieved_rps = total_completed as f64 / elapsed.as_secs_f64();
     let corrected = Summary::from(&merged.corrected);
@@ -293,7 +370,8 @@ async fn connection_task(
     req_bytes: Arc<Vec<u8>>,
     expected_status: Arc<Vec<u16>>,
     counters: Arc<LiveCounters>,
-    throughput_us: f64,
+    histos: Arc<Mutex<Histos>>,
+    schedule: RateSchedule,
     offset_us: u64,
     duration_s: u64,
     timeout: Duration,
@@ -326,7 +404,12 @@ async fn connection_task(
     };
     let deadline = worker_start + Duration::from_secs(duration_s);
 
-    let mut sched = ConnSched::new(offset_us, throughput_us);
+    let mut sched = match schedule {
+        RateSchedule::Constant { throughput_us } => ConnSched::new(offset_us, throughput_us),
+        RateSchedule::Ramp { duration_us, peak_throughput_us } => {
+            ConnSched::ramp(offset_us, duration_us, peak_throughput_us)
+        }
+    };
     let mut buf = vec![0u8; READ_BUF_BYTES];
     let mut buf_len = 0usize;
 
@@ -379,7 +462,11 @@ async fn connection_task(
         let recv_us = worker_start.elapsed().as_micros() as u64;
         let corrected = recv_us.saturating_sub(intended_us).max(1);
         let uncorrected = recv_us.saturating_sub(actual_send_us).max(1);
-        res.histos.record(corrected, uncorrected);
+        // Brief lock — record both samples under one acquisition.
+        {
+            let mut h = histos.lock().unwrap();
+            h.record(corrected, uncorrected);
+        }
         res.completed += 1;
         counters.completed.fetch_add(1, Ordering::Relaxed);
         if is_pass(status, &expected_status) {

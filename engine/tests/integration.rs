@@ -36,6 +36,7 @@ async fn engine_hits_target_rps_against_healthy_mock() {
         keepalive: true,
         timeout: Duration::from_secs(5),
         expected_status: vec![],
+        ramp: false,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -96,6 +97,7 @@ async fn status_tier_assertion_catches_fast500() {
         keepalive: true,
         timeout: Duration::from_secs(3),
         expected_status: vec![200],
+        ramp: false,
     };
 
     let report = run(spec).await.expect("run completed");

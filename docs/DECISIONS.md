@@ -109,6 +109,25 @@ change the tokens; components read them. NOTE: the UI was NOT visually verified 
 a browser this session (no display/browser available) — only type-checked, built,
 and its API wiring exercised. Eyeball it before relying on the look.
 
+### [D15] Shared `Arc<Mutex<Histos>>` instead of per-task SyncHistogram
+The tick task and the final report both read corrected percentiles, which needs
+a snapshot view of all conn tasks' recordings. Options were (a) `SyncHistogram`
+with per-task recorders + `refresh()` from the tick task (lock-free record),
+(b) `Arc<Mutex<Histos>>` shared across tasks (~50 ns/lock at 2000 RPS aggregate
+= 200 µs/sec total — invisible). Picked (b) for code simplicity; gate-#1
+numbers held: corrected p50 23.3 ms, p99 24.8 ms (vs wrk2 22.6 / 24.9), same
+as the lock-free version. **Review:** if we ever target much higher single-box
+throughput where 2000 RPS scales to 100k, revisit (a).
+
+### [D16] Bucket width = 10 RPS, one bucket per tick
+api.md's SSE tick example uses 10-RPS buckets. Engine emits exactly ONE bucket
+per tick (the bucket the tick's `achieved_rps_1s` falls into); clients sum
+matching buckets across ticks to assemble the cliff curve. This keeps the tick
+payload bounded and lets ramped runs sweep many buckets while fixed-rate runs
+hit one bucket (chart with one data point). **Review:** if we add multi-rate
+shaped workloads (step functions, sine wave), we may want per-tick multi-bucket
+emission instead.
+
 ### [D13] Web ↔ control wiring via vite dev proxy (not CORS)
 The browser calls same-origin `/v1/...`; the vite dev server proxies to control
 (`CONTROL_PROXY_TARGET`, default localhost:8000; `http://control:8000` in compose).

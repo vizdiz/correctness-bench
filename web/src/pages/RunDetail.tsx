@@ -4,9 +4,9 @@ import { api, type RunView, type Tick } from '../lib/api'
 import { Button } from '../components/ui/Button'
 import { Card, CardBody, CardHeader } from '../components/ui/Card'
 import { NumberDisplay } from '../components/ui/NumberDisplay'
-import { Sparkline } from '../components/ui/Sparkline'
 import { StatusBadge } from '../components/ui/StatusBadge'
-import { int, round } from '../lib/format'
+import { HeadlineChart } from '../components/charts/HeadlineChart'
+import { int, round, usToMs } from '../lib/format'
 
 const terminal = new Set(['completed', 'failed', 'aborted'])
 const MAX_TICKS_HISTORY = 120
@@ -78,10 +78,6 @@ export function RunDetail() {
     latest && latest.this_tick.total > 0
       ? (latest.this_tick.pass / latest.this_tick.total) * 100
       : null
-  const correctnessSeries = ticks.map((t) =>
-    t.this_tick.total > 0 ? t.this_tick.pass / t.this_tick.total : 1,
-  )
-  const rpsSeries = ticks.map((t) => t.achieved_rps_1s)
 
   return (
     <div>
@@ -117,10 +113,10 @@ export function RunDetail() {
         )}
       </header>
 
-      {/* Stat strip — live values when SSE is delivering ticks, fall back to
-          the stored run metadata otherwise. */}
+      {/* Stat strip — live values when SSE is delivering ticks. Latency is the
+          flat axis of the headline; pass rate is the cliff. */}
       <Card className="mb-6">
-        <CardBody className="grid grid-cols-2 gap-6 sm:grid-cols-4">
+        <CardBody className="grid grid-cols-2 gap-6 sm:grid-cols-5">
           <NumberDisplay label="Target RPS" value={int(run.target_rps)} tone="accent" />
           <NumberDisplay
             label="Achieved RPS"
@@ -133,42 +129,35 @@ export function RunDetail() {
             tone={passRate != null && passRate < 95 ? 'danger' : 'correct'}
           />
           <NumberDisplay
-            label="Completed"
-            value={latest ? int(latest.completed_total) : '—'}
+            label="Latency p50"
+            value={latest ? usToMs(latest.percentiles_so_far.p50_us) : '—'}
+            unit="ms"
+            tone="accent"
+          />
+          <NumberDisplay
+            label="Latency p99"
+            value={latest ? usToMs(latest.percentiles_so_far.p99_us) : '—'}
+            unit="ms"
+            tone="accent"
           />
         </CardBody>
       </Card>
 
-      {/* Headline: correctness vs load. Real data once any ticks have arrived;
-          placeholder shape until then. */}
+      {/* Headline chart: correctness vs offered RPS (green, left axis) +
+          corrected p99 latency (blue, right axis). One screenshot of the
+          product's pitch — green cliffs while blue stays flat. */}
       <Card>
         <CardHeader
           title="Correctness vs load"
           subtitle={
             ticks.length > 0
               ? `${ticks.length} live tick(s) · pass=${latest?.pass_total} fail_status=${latest?.fail_status_total}`
-              : 'The headline: latency flat while correctness cliffs. Live via SSE.'
+              : 'Latency flat (blue, right axis) while correctness cliffs (green, left axis). Live via SSE.'
           }
         />
         <CardBody>
-          <div className="flex flex-col items-center justify-center gap-4 py-10 text-center">
-            <Sparkline
-              data={correctnessSeries.length > 1 ? correctnessSeries : undefined}
-              tone="correct"
-              width={420}
-              height={64}
-            />
-            <Sparkline
-              data={rpsSeries.length > 1 ? rpsSeries : undefined}
-              tone="accent"
-              width={420}
-              height={32}
-            />
-            <p className="max-w-md text-xs text-text-faint">
-              {ticks.length === 0
-                ? 'Waiting for ticks. Start the engine with --push-to and --run-id pointed at this run.'
-                : 'Top: correctness (green, 0–100%). Bottom: achieved RPS (blue). When the green line cliffs while blue stays flat — that’s the headline.'}
-            </p>
+          <div className="flex justify-center">
+            <HeadlineChart ticks={ticks} />
           </div>
         </CardBody>
       </Card>

@@ -483,4 +483,56 @@ engine-Tick subset), tick persistence to `run_ticks`, SSE resume via
 `Last-Event-ID`. All clearly enumerated in the api.md frozen contract; this
 v0 transport is shape-compatible enough to grow into it.
 
+## 2026-05-31 — Headline complete: live latency + ramp + per-RPS buckets + chart
+
+Three slices delivered together because they snap into one shape end-to-end.
+
+### Step 1 — Live latency in ticks
+- Per-conn `Histos` removed; replaced with `Arc<Mutex<Histos>>` shared across
+  all conn tasks (DECISIONS D15). Mutex overhead at 2000 RPS aggregate is
+  microseconds/sec total — gate-#1 numbers unchanged (corrected p50 23.3 ms,
+  p99 24.8 ms; ≤ ±5% vs wrk2).
+- Tick task snapshots `percentiles_so_far: { p50_us, p99_us }` (corrected)
+  each second. Matches api.md SSE shape exactly.
+- Mirror types in Go control `sse.PercentilesSoFar`, web `Tick.percentiles_so_far`.
+
+### Step 2 — `--ramp` + per-RPS buckets
+- `ConnSched::RateSchedule` enum: `Constant { throughput_us }` (the gate-#1
+  mode) and `Ramp { duration_us, peak_throughput_us }` (`t(n) = √(2·D·n/R)`,
+  fire-immediately-when-behind, no wrk2 catch-up bump — `caught_up` toggling
+  on `Ramp` is meaningless).
+- RunSpec gets `ramp: bool`; CLI gets `--ramp`. Stagger continues to use the
+  peak per-conn interval (same as target for Constant), so wake-ups stay
+  spread late in a ramp.
+- Each Tick carries `buckets: Vec<Bucket>` (one entry: the bucket the tick's
+  `achieved_rps_1s` falls into, 10-RPS-wide per DECISIONS D16). Clients sum
+  matching buckets across ticks.
+- Two new sched unit tests: `ramp_intended_times_match_inverse_integral`
+  (after `R·D/2` requests, intended time ≈ D) and `ramp_fires_immediately_when_behind`.
+
+### Step 3 — Real headline chart in web
+- New `components/charts/HeadlineChart.tsx`: dual-axis SVG, X = offered RPS
+  (bucket center), left axis = correctness % (green), right axis = corrected
+  p99 latency (blue). One screenshot is the product's pitch.
+- RunDetail replaces the placeholder sparklines with `<HeadlineChart ticks={ticks} />`.
+- Aggregation: by `bucket.rps_lo` across all received ticks (sum total/pass,
+  latest p99).
+
+### Live ramp demo — the cliff in one screen, in numbers
+
+`mock fast500 cliff_rps=150 pct=100`, engine `--rate 300 --duration-s 30 --ramp -c 30`:
+
+| t (s) | RPS | bucket | pass | p99 (ms) |
+|------:|----:|--------|-----:|---------:|
+| 1-15  | climbing 30→145 | all `[30..150)` | **100.0%** | ~25-27 |
+| 16    | **156** | `[150,160)` | **91.7%** ← cliff begins | 26.8 |
+| 17    | 152 | `[150,160)` | **40.1%** | 26.8 |
+| 18    | 178 | `[170,180)` | **1.1%** | 26.8 |
+| 19-30 | climbing 181→294 | `[180..300)` | **0.0%** | ~26 |
+
+**Latency stays at 25-27 ms across the entire ramp** (flat blue line) while
+**correctness collapses from 100% → 0% as RPS crosses cliff=150** (green cliff).
+The product's headline is now empirically demonstrated as a single chart in one
+30-second run instead of needing multiple fixed-rate invocations.
+
 <!-- Subsequent phases append below this line. -->

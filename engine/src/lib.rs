@@ -8,5 +8,7 @@ pub mod sched;
 pub mod worker;
 
 pub use hist::{Histos, Summary};
-pub use sched::ConnSched;
-pub use worker::{run, run_with_ticks, RunReport, RunSpec, ThisTick, Tick};
+pub use sched::{ConnSched, RateSchedule};
+pub use worker::{
+    run, run_with_ticks, Bucket, PercentilesSoFar, RunReport, RunSpec, ThisTick, Tick,
+};

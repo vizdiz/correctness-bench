@@ -80,7 +80,20 @@ export interface Tick {
   /** Counts FOR THIS TICK only — per-second deltas. The headline green line
       plots `this_tick.pass / this_tick.total` to show the per-second cliff. */
   this_tick: { total: number; pass: number; fail_status: number }
+  /** Running corrected p50/p99 latency snapshot (api.md `percentiles_so_far`). */
+  percentiles_so_far: { p50_us: number; p99_us: number }
+  /** Per-RPS bucket entries attributable to this tick. Clients accumulate
+      across ticks to build the correctness-vs-load curve. */
+  buckets?: Bucket[]
   ts?: string
+}
+
+export interface Bucket {
+  rps_lo: number
+  rps_hi: number
+  total: number
+  pass: number
+  fail_status: number
 }
 
 export interface ApiErrorBody {

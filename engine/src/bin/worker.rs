@@ -63,6 +63,11 @@ struct Cli {
     /// Run UUID to push ticks against. Must be paired with --push-to.
     #[arg(long)]
     run_id: Option<String>,
+
+    /// Linearly ramp the offered rate from 0 to --rate over --duration-s.
+    /// One run sweeps the whole load axis — the cliff appears as a curve.
+    #[arg(long)]
+    ramp: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -91,6 +96,7 @@ fn main() -> anyhow::Result<()> {
             keepalive: !cli.no_keepalive,
             timeout: Duration::from_secs(cli.timeout_s),
             expected_status: cli.expected_status.clone(),
+            ramp: cli.ramp,
         };
 
         eprintln!(

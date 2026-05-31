@@ -16,13 +16,24 @@ import (
 // Tick is what engine workers push. Shape is a subset of api.md's SSE tick
 // event so that growing fields toward full api.md parity is additive.
 type Tick struct {
-	ElapsedS        uint64    `json:"elapsed_s"`
-	AchievedRps1S   float64   `json:"achieved_rps_1s"`
-	CompletedTotal  uint64    `json:"completed_total"`
-	PassTotal       uint64    `json:"pass_total"`
-	FailStatusTotal uint64    `json:"fail_status_total"`
-	ThisTick        ThisTick  `json:"this_tick"`
-	TS              time.Time `json:"ts,omitempty"` // server-stamped on ingest
+	ElapsedS         uint64            `json:"elapsed_s"`
+	AchievedRps1S    float64           `json:"achieved_rps_1s"`
+	CompletedTotal   uint64            `json:"completed_total"`
+	PassTotal        uint64            `json:"pass_total"`
+	FailStatusTotal  uint64            `json:"fail_status_total"`
+	ThisTick         ThisTick          `json:"this_tick"`
+	PercentilesSoFar PercentilesSoFar  `json:"percentiles_so_far"`
+	Buckets          []Bucket          `json:"buckets,omitempty"`
+	TS               time.Time         `json:"ts,omitempty"` // server-stamped on ingest
+}
+
+// Bucket is one per-RPS correctness bucket. api.md SSE tick `buckets` entry.
+type Bucket struct {
+	RpsLo      float64 `json:"rps_lo"`
+	RpsHi      float64 `json:"rps_hi"`
+	Total      uint64  `json:"total"`
+	Pass       uint64  `json:"pass"`
+	FailStatus uint64  `json:"fail_status"`
 }
 
 // ThisTick holds the counts attributable to JUST the last 1 s window. Per-tick
@@ -31,6 +42,13 @@ type ThisTick struct {
 	Total      uint64 `json:"total"`
 	Pass       uint64 `json:"pass"`
 	FailStatus uint64 `json:"fail_status"`
+}
+
+// PercentilesSoFar is the running corrected p50/p99 latency snapshot. api.md
+// names this `percentiles_so_far`.
+type PercentilesSoFar struct {
+	P50US uint64 `json:"p50_us"`
+	P99US uint64 `json:"p99_us"`
 }
 
 // Broker fans run-scoped Ticks out to N concurrent subscribers per run.
