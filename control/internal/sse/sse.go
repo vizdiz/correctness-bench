@@ -29,19 +29,25 @@ type Tick struct {
 
 // Bucket is one per-RPS correctness bucket. api.md SSE tick `buckets` entry.
 type Bucket struct {
-	RpsLo      float64 `json:"rps_lo"`
-	RpsHi      float64 `json:"rps_hi"`
-	Total      uint64  `json:"total"`
-	Pass       uint64  `json:"pass"`
-	FailStatus uint64  `json:"fail_status"`
+	RpsLo           float64 `json:"rps_lo"`
+	RpsHi           float64 `json:"rps_hi"`
+	Total           uint64  `json:"total"`
+	Pass            uint64  `json:"pass"`
+	FailStatus      uint64  `json:"fail_status"`
+	FailLatency     uint64  `json:"fail_latency"`
+	FailSize        uint64  `json:"fail_size"`
+	FailContentType uint64  `json:"fail_content_type"`
 }
 
 // ThisTick holds the counts attributable to JUST the last 1 s window. Per-tick
 // pass rate (pass / total) is what the web's cliff sparkline plots.
 type ThisTick struct {
-	Total      uint64 `json:"total"`
-	Pass       uint64 `json:"pass"`
-	FailStatus uint64 `json:"fail_status"`
+	Total           uint64 `json:"total"`
+	Pass            uint64 `json:"pass"`
+	FailStatus      uint64 `json:"fail_status"`
+	FailLatency     uint64 `json:"fail_latency"`
+	FailSize        uint64 `json:"fail_size"`
+	FailContentType uint64 `json:"fail_content_type"`
 }
 
 // PercentilesSoFar is the running corrected p50/p99 latency snapshot. api.md

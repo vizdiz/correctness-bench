@@ -36,6 +36,10 @@ async fn engine_hits_target_rps_against_healthy_mock() {
         keepalive: true,
         timeout: Duration::from_secs(5),
         expected_status: vec![],
+        max_latency_us: None,
+        min_body_bytes: None,
+        max_body_bytes: None,
+        content_type: None,
         ramp: false,
     };
 
@@ -97,6 +101,10 @@ async fn status_tier_assertion_catches_fast500() {
         keepalive: true,
         timeout: Duration::from_secs(3),
         expected_status: vec![200],
+        max_latency_us: None,
+        min_body_bytes: None,
+        max_body_bytes: None,
+        content_type: None,
         ramp: false,
     };
 
@@ -108,4 +116,82 @@ async fn status_tier_assertion_catches_fast500() {
         report.fail_status, report.completed,
         "every completed request should be classified fail_status"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn size_tier_assertion_catches_truncate() {
+    // Mock above cliff in truncate mode returns a body shorter than the
+    // healthy body (size + invalid JSON). The status is still 200; only the
+    // size-tier assertion should fire.
+    let addr = spawn_mock().await;
+    let url = Uri::try_from(format!(
+        "http://{addr}/api?mode=truncate&cliff_rps=0&pct=100&base_latency_ms=1"
+    ))
+    .unwrap();
+
+    // Healthy body is 47 bytes; truncate body is 40 bytes. min=44 separates.
+    let spec = RunSpec {
+        url,
+        method: Method::GET,
+        target_rps: 200.0,
+        duration_s: 3,
+        connections: 10,
+        keepalive: true,
+        timeout: Duration::from_secs(3),
+        expected_status: vec![200],
+        max_latency_us: None,
+        min_body_bytes: Some(44),
+        max_body_bytes: None,
+        content_type: None,
+        ramp: false,
+    };
+
+    let report = run(spec).await.expect("run completed");
+    assert!(report.completed >= 500, "got {} completions", report.completed);
+    assert_eq!(report.fail_status, 0, "status was 200, no status fails");
+    assert_eq!(
+        report.fail_size, report.completed,
+        "every truncated response should be fail_size; pass={} fail_size={}",
+        report.pass, report.fail_size
+    );
+    assert_eq!(report.pass, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn latency_tier_assertion_catches_slow_ok() {
+    // Mock slow_ok above cliff returns the correct body but slept ~520ms total
+    // (base + slow_penalty=500). With max_latency=200ms every response is
+    // fail_latency. Status is 200 and body is correct, so size/status pass.
+    let addr = spawn_mock().await;
+    let url = Uri::try_from(format!(
+        "http://{addr}/api?mode=slow_ok&cliff_rps=0&pct=100&base_latency_ms=20"
+    ))
+    .unwrap();
+
+    let spec = RunSpec {
+        url,
+        method: Method::GET,
+        target_rps: 10.0, // keep light — slow_ok puts ~500ms per request
+        duration_s: 4,
+        connections: 5,
+        keepalive: true,
+        timeout: Duration::from_secs(5),
+        expected_status: vec![200],
+        max_latency_us: Some(200_000), // 200ms ceiling
+        min_body_bytes: None,
+        max_body_bytes: None,
+        content_type: None,
+        ramp: false,
+    };
+
+    let report = run(spec).await.expect("run completed");
+    assert!(report.completed >= 10, "got {} completions", report.completed);
+    assert_eq!(report.fail_status, 0);
+    assert_eq!(report.fail_size, 0);
+    assert_eq!(
+        report.fail_latency, report.completed,
+        "slow_ok body is correct but latency > 200ms; fail_latency={} completed={}",
+        report.fail_latency, report.completed
+    );
+    assert_eq!(report.pass, 0);
 }

@@ -49,6 +49,19 @@ pub struct RunSpec {
     /// semantics): empty = any 2xx is pass; non-empty = status must be in the
     /// list to be pass. Anything else is `fail_status`.
     pub expected_status: Vec<u16>,
+    /// Inline latency-tier assertion. If set, any response with
+    /// `corrected_us > max_latency_us` is classified `fail_latency`.
+    pub max_latency_us: Option<u64>,
+    /// Inline size-tier assertion. If set, any response whose Content-Length
+    /// is below this value is classified `fail_size`.
+    pub min_body_bytes: Option<u64>,
+    /// Inline size-tier assertion. If set, any response whose Content-Length
+    /// is above this value is classified `fail_size`.
+    pub max_body_bytes: Option<u64>,
+    /// Inline content-type-tier assertion. If set, any response whose
+    /// Content-Type does NOT begin with this string (case-insensitive) is
+    /// classified `fail_content_type`. Prefix match handles `; charset=...`.
+    pub content_type: Option<String>,
     /// When true, ramp the offered rate linearly from 0 to `target_rps` over
     /// `duration_s`. Reveals the full cliff curve in a single run.
     pub ramp: bool,
@@ -63,6 +76,9 @@ pub struct RunReport {
     pub completed: u64,
     pub pass: u64,
     pub fail_status: u64,
+    pub fail_latency: u64,
+    pub fail_size: u64,
+    pub fail_content_type: u64,
     pub conn_errors: u64,
     pub timeouts: u64,
     pub corrected: Summary,
@@ -74,16 +90,91 @@ struct ConnResult {
     completed: u64,
     pass: u64,
     fail_status: u64,
+    fail_latency: u64,
+    fail_size: u64,
+    fail_content_type: u64,
     conn_errors: u64,
     timeouts: u64,
 }
 
-/// Classify a response per bench.proto's AssertSpec.expected_status semantics.
-fn is_pass(status: u16, expected: &[u16]) -> bool {
-    if expected.is_empty() {
-        (200..300).contains(&status)
-    } else {
-        expected.contains(&status)
+/// What the worker concluded about one response. Mutually exclusive — bench.proto's
+/// RpsBucket counters are mutually exclusive too. Priority is fixed and matches
+/// the order assertions are evaluated: status first, then latency, then size,
+/// then content-type. (Status is checked first so a 5xx with any body shape
+/// reports as fail_status, not fail_size.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Pass,
+    FailStatus,
+    FailLatency,
+    FailSize,
+    FailContentType,
+}
+
+/// Inline assertion bundle — pre-built once per run from the RunSpec fields.
+/// Reduces per-request work to a few comparisons.
+#[derive(Debug, Clone)]
+struct InlineAssert {
+    expected_status: Vec<u16>,
+    max_latency_us: Option<u64>,
+    min_body_bytes: Option<u64>,
+    max_body_bytes: Option<u64>,
+    /// Lower-cased prefix to match against the response's Content-Type.
+    content_type_lc_prefix: Option<String>,
+}
+
+impl InlineAssert {
+    fn from_spec(spec: &RunSpec) -> Self {
+        Self {
+            expected_status: spec.expected_status.clone(),
+            max_latency_us: spec.max_latency_us,
+            min_body_bytes: spec.min_body_bytes,
+            max_body_bytes: spec.max_body_bytes,
+            content_type_lc_prefix: spec.content_type.as_ref().map(|s| s.to_ascii_lowercase()),
+        }
+    }
+
+    fn classify(
+        &self,
+        status: u16,
+        corrected_us: u64,
+        content_length: u64,
+        content_type_lc: Option<&str>,
+    ) -> Verdict {
+        // Status tier first — any non-matching status is fail_status regardless
+        // of body shape (a 500 with the right content-type is still fail_status).
+        let status_ok = if self.expected_status.is_empty() {
+            (200..300).contains(&status)
+        } else {
+            self.expected_status.contains(&status)
+        };
+        if !status_ok {
+            return Verdict::FailStatus;
+        }
+        if let Some(max) = self.max_latency_us {
+            if corrected_us > max {
+                return Verdict::FailLatency;
+            }
+        }
+        if let Some(min) = self.min_body_bytes {
+            if content_length < min {
+                return Verdict::FailSize;
+            }
+        }
+        if let Some(max) = self.max_body_bytes {
+            if content_length > max {
+                return Verdict::FailSize;
+            }
+        }
+        if let Some(want_prefix) = &self.content_type_lc_prefix {
+            let ok = content_type_lc
+                .map(|got| got.starts_with(want_prefix.as_str()))
+                .unwrap_or(false);
+            if !ok {
+                return Verdict::FailContentType;
+            }
+        }
+        Verdict::Pass
     }
 }
 
@@ -96,6 +187,9 @@ struct LiveCounters {
     completed: AtomicU64,
     pass: AtomicU64,
     fail_status: AtomicU64,
+    fail_latency: AtomicU64,
+    fail_size: AtomicU64,
+    fail_content_type: AtomicU64,
 }
 
 /// One-second snapshot of the run's progress. Shape is a subset of api.md's
@@ -124,6 +218,9 @@ pub struct ThisTick {
     pub total: u64,
     pub pass: u64,
     pub fail_status: u64,
+    pub fail_latency: u64,
+    pub fail_size: u64,
+    pub fail_content_type: u64,
 }
 
 /// Running-percentile snapshot. api.md SSE tick names this
@@ -145,6 +242,9 @@ pub struct Bucket {
     pub total: u64,
     pub pass: u64,
     pub fail_status: u64,
+    pub fail_latency: u64,
+    pub fail_size: u64,
+    pub fail_content_type: u64,
 }
 
 /// Bucket width on the offered-RPS axis. 10 RPS matches the api.md example.
@@ -223,7 +323,7 @@ pub async fn run_with_ticks(
         tokio::sync::watch::channel::<Option<Instant>>(None);
     let timeout = spec.timeout;
 
-    let expected_status = Arc::new(spec.expected_status.clone());
+    let assert_rules = Arc::new(InlineAssert::from_spec(&spec));
     let counters = Arc::new(LiveCounters::default());
     // Shared corrected/uncorrected histograms — all conn tasks lock briefly to
     // record. At 2000 RPS aggregate the per-lock cost is microseconds/sec total,
@@ -236,14 +336,14 @@ pub async fn run_with_ticks(
         let host = host.clone();
         let barrier = barrier.clone();
         let req_bytes = req_bytes.clone();
-        let expected_status = expected_status.clone();
+        let assert_rules = assert_rules.clone();
         let counters = counters.clone();
         let histos = histos.clone();
         let mut rx = worker_start_rx_template.clone();
         let offset_us = conn_id as u64 * stagger_us;
         joinset.spawn(async move {
             connection_task(
-                host, port, req_bytes, expected_status, counters, histos,
+                host, port, req_bytes, assert_rules, counters, histos,
                 per_conn_schedule, offset_us,
                 spec.duration_s, timeout, barrier, &mut rx,
             )
@@ -265,6 +365,9 @@ pub async fn run_with_ticks(
             let mut prev_completed = 0u64;
             let mut prev_pass = 0u64;
             let mut prev_fail_status = 0u64;
+            let mut prev_fail_latency = 0u64;
+            let mut prev_fail_size = 0u64;
+            let mut prev_fail_content_type = 0u64;
             for elapsed_s in 1..=duration_s {
                 tokio::time::sleep_until(
                     tokio::time::Instant::from_std(worker_start + Duration::from_secs(elapsed_s)),
@@ -272,16 +375,25 @@ pub async fn run_with_ticks(
                 .await;
                 let c = counters.completed.load(Ordering::Relaxed);
                 let p = counters.pass.load(Ordering::Relaxed);
-                let f = counters.fail_status.load(Ordering::Relaxed);
+                let fs = counters.fail_status.load(Ordering::Relaxed);
+                let fl = counters.fail_latency.load(Ordering::Relaxed);
+                let fz = counters.fail_size.load(Ordering::Relaxed);
+                let fct = counters.fail_content_type.load(Ordering::Relaxed);
                 let this_tick = ThisTick {
                     total: c.saturating_sub(prev_completed),
                     pass: p.saturating_sub(prev_pass),
-                    fail_status: f.saturating_sub(prev_fail_status),
+                    fail_status: fs.saturating_sub(prev_fail_status),
+                    fail_latency: fl.saturating_sub(prev_fail_latency),
+                    fail_size: fz.saturating_sub(prev_fail_size),
+                    fail_content_type: fct.saturating_sub(prev_fail_content_type),
                 };
                 let achieved_rps_1s = this_tick.total as f64;
                 prev_completed = c;
                 prev_pass = p;
-                prev_fail_status = f;
+                prev_fail_status = fs;
+                prev_fail_latency = fl;
+                prev_fail_size = fz;
+                prev_fail_content_type = fct;
 
                 // Snapshot percentiles under the lock. Brief — value_at_quantile
                 // is O(buckets) but bounded by HDR's structure (~hundreds).
@@ -302,6 +414,9 @@ pub async fn run_with_ticks(
                     total: this_tick.total,
                     pass: this_tick.pass,
                     fail_status: this_tick.fail_status,
+                    fail_latency: this_tick.fail_latency,
+                    fail_size: this_tick.fail_size,
+                    fail_content_type: this_tick.fail_content_type,
                 };
 
                 if tx
@@ -310,7 +425,7 @@ pub async fn run_with_ticks(
                         achieved_rps_1s,
                         completed_total: c,
                         pass_total: p,
-                        fail_status_total: f,
+                        fail_status_total: fs,
                         this_tick,
                         percentiles_so_far,
                         buckets: vec![bucket],
@@ -328,6 +443,9 @@ pub async fn run_with_ticks(
     let mut total_completed = 0u64;
     let mut total_pass = 0u64;
     let mut total_fail_status = 0u64;
+    let mut total_fail_latency = 0u64;
+    let mut total_fail_size = 0u64;
+    let mut total_fail_content_type = 0u64;
     while let Some(joined) = joinset.join_next().await {
         let res = joined.context("connection task panicked")?;
         conn_errors += res.conn_errors;
@@ -335,6 +453,9 @@ pub async fn run_with_ticks(
         total_completed += res.completed;
         total_pass += res.pass;
         total_fail_status += res.fail_status;
+        total_fail_latency += res.fail_latency;
+        total_fail_size += res.fail_size;
+        total_fail_content_type += res.fail_content_type;
     }
 
     if let Some(h) = tick_handle {
@@ -356,6 +477,9 @@ pub async fn run_with_ticks(
         completed: total_completed,
         pass: total_pass,
         fail_status: total_fail_status,
+        fail_latency: total_fail_latency,
+        fail_size: total_fail_size,
+        fail_content_type: total_fail_content_type,
         conn_errors,
         timeouts,
         corrected,
@@ -368,7 +492,7 @@ async fn connection_task(
     host: String,
     port: u16,
     req_bytes: Arc<Vec<u8>>,
-    expected_status: Arc<Vec<u16>>,
+    assert_rules: Arc<InlineAssert>,
     counters: Arc<LiveCounters>,
     histos: Arc<Mutex<Histos>>,
     schedule: RateSchedule,
@@ -446,18 +570,17 @@ async fn connection_task(
         }
 
         // Read until we have a complete response (headers + body).
-        let (msg_len, status) =
-            match read_one_response(&mut stream, &mut buf, &mut buf_len, timeout).await {
-                ReadResult::Ok { msg_len, status } => (msg_len, status),
-                ReadResult::Timeout => {
-                    res.timeouts += 1;
-                    break;
-                }
-                ReadResult::Err => {
-                    res.conn_errors += 1;
-                    break;
-                }
-            };
+        let parsed = match read_one_response(&mut stream, &mut buf, &mut buf_len, timeout).await {
+            ReadResult::Ok(parsed) => parsed,
+            ReadResult::Timeout => {
+                res.timeouts += 1;
+                break;
+            }
+            ReadResult::Err => {
+                res.conn_errors += 1;
+                break;
+            }
+        };
 
         let recv_us = worker_start.elapsed().as_micros() as u64;
         let corrected = recv_us.saturating_sub(intended_us).max(1);
@@ -469,13 +592,37 @@ async fn connection_task(
         }
         res.completed += 1;
         counters.completed.fetch_add(1, Ordering::Relaxed);
-        if is_pass(status, &expected_status) {
-            res.pass += 1;
-            counters.pass.fetch_add(1, Ordering::Relaxed);
-        } else {
-            res.fail_status += 1;
-            counters.fail_status.fetch_add(1, Ordering::Relaxed);
+
+        let verdict = assert_rules.classify(
+            parsed.status,
+            corrected,
+            parsed.content_length,
+            parsed.content_type_lc.as_deref(),
+        );
+        match verdict {
+            Verdict::Pass => {
+                res.pass += 1;
+                counters.pass.fetch_add(1, Ordering::Relaxed);
+            }
+            Verdict::FailStatus => {
+                res.fail_status += 1;
+                counters.fail_status.fetch_add(1, Ordering::Relaxed);
+            }
+            Verdict::FailLatency => {
+                res.fail_latency += 1;
+                counters.fail_latency.fetch_add(1, Ordering::Relaxed);
+            }
+            Verdict::FailSize => {
+                res.fail_size += 1;
+                counters.fail_size.fetch_add(1, Ordering::Relaxed);
+            }
+            Verdict::FailContentType => {
+                res.fail_content_type += 1;
+                counters.fail_content_type.fetch_add(1, Ordering::Relaxed);
+            }
         }
+
+        let msg_len = parsed.msg_len;
 
         // Shift any pipelined-extra bytes to the front. Without pipelining
         // buf_len == msg_len, so this is just a reset.
@@ -492,8 +639,17 @@ async fn connection_task(
     res
 }
 
+struct ParsedResponse {
+    msg_len: usize,
+    status: u16,
+    content_length: u64,
+    /// Content-Type header value, lowercased (None if absent). Owned because
+    /// the response buffer is reused for the next request.
+    content_type_lc: Option<String>,
+}
+
 enum ReadResult {
-    Ok { msg_len: usize, status: u16 },
+    Ok(ParsedResponse),
     Timeout,
     Err,
 }
@@ -517,17 +673,28 @@ async fn read_one_response(
             let mut resp = httparse::Response::new(&mut headers);
             match resp.parse(&buf[..*buf_len]) {
                 Ok(httparse::Status::Complete(hdr_end)) => {
-                    let cl = resp
-                        .headers
-                        .iter()
-                        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                        .and_then(|h| std::str::from_utf8(h.value).ok())
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    let total = hdr_end + cl;
+                    let mut cl: u64 = 0;
+                    let mut content_type_lc: Option<String> = None;
+                    for h in resp.headers.iter() {
+                        if h.name.eq_ignore_ascii_case("content-length") {
+                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                cl = s.trim().parse::<u64>().unwrap_or(0);
+                            }
+                        } else if h.name.eq_ignore_ascii_case("content-type") {
+                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                content_type_lc = Some(s.trim().to_ascii_lowercase());
+                            }
+                        }
+                    }
+                    let total = hdr_end + cl as usize;
                     let status = resp.code.unwrap_or(0);
                     if *buf_len >= total {
-                        ParseOutcome::Complete { msg_len: total, status }
+                        ParseOutcome::Complete {
+                            msg_len: total,
+                            status,
+                            content_length: cl,
+                            content_type_lc,
+                        }
                     } else {
                         ParseOutcome::NeedMore
                     }
@@ -538,8 +705,13 @@ async fn read_one_response(
         };
 
         match parse_outcome {
-            ParseOutcome::Complete { msg_len, status } => {
-                return ReadResult::Ok { msg_len, status }
+            ParseOutcome::Complete { msg_len, status, content_length, content_type_lc } => {
+                return ReadResult::Ok(ParsedResponse {
+                    msg_len,
+                    status,
+                    content_length,
+                    content_type_lc,
+                });
             }
             ParseOutcome::Bad => return ReadResult::Err,
             ParseOutcome::NeedMore => {}
@@ -563,7 +735,12 @@ async fn read_one_response(
 }
 
 enum ParseOutcome {
-    Complete { msg_len: usize, status: u16 },
+    Complete {
+        msg_len: usize,
+        status: u16,
+        content_length: u64,
+        content_type_lc: Option<String>,
+    },
     NeedMore,
     Bad,
 }

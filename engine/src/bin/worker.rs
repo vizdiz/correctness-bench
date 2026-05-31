@@ -68,6 +68,23 @@ struct Cli {
     /// One run sweeps the whole load axis — the cliff appears as a curve.
     #[arg(long)]
     ramp: bool,
+
+    /// Inline latency-tier assertion: any corrected latency > N ms is fail_latency.
+    #[arg(long)]
+    max_latency_ms: Option<u64>,
+
+    /// Inline size-tier assertion: Content-Length below N bytes is fail_size.
+    #[arg(long)]
+    min_body_bytes: Option<u64>,
+
+    /// Inline size-tier assertion: Content-Length above N bytes is fail_size.
+    #[arg(long)]
+    max_body_bytes: Option<u64>,
+
+    /// Inline content-type-tier assertion. Case-insensitive prefix match
+    /// (e.g. `--content-type application/json` matches `; charset=utf-8`).
+    #[arg(long)]
+    content_type: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -96,6 +113,10 @@ fn main() -> anyhow::Result<()> {
             keepalive: !cli.no_keepalive,
             timeout: Duration::from_secs(cli.timeout_s),
             expected_status: cli.expected_status.clone(),
+            max_latency_us: cli.max_latency_ms.map(|ms| ms * 1000),
+            min_body_bytes: cli.min_body_bytes,
+            max_body_bytes: cli.max_body_bytes,
+            content_type: cli.content_type.clone(),
             ramp: cli.ramp,
         };
 
@@ -201,8 +222,15 @@ fn main() -> anyhow::Result<()> {
                 .join(",")
         };
         println!(
-            "  Correctness        {} / {} pass  ({:.1}%)  fail_status={}  (expected: {})",
-            report.pass, report.completed, pass_rate, report.fail_status, expected_label
+            "  Correctness        {} / {} pass  ({:.1}%)  (expected status: {})",
+            report.pass, report.completed, pass_rate, expected_label
+        );
+        println!(
+            "  Fail by tier       status={}  latency={}  size={}  content_type={}",
+            report.fail_status,
+            report.fail_latency,
+            report.fail_size,
+            report.fail_content_type,
         );
         Ok::<_, anyhow::Error>(())
     })?;

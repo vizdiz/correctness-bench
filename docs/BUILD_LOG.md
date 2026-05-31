@@ -535,4 +535,61 @@ Three slices delivered together because they snap into one shape end-to-end.
 The product's headline is now empirically demonstrated as a single chart in one
 30-second run instead of needing multiple fixed-rate invocations.
 
+## 2026-05-31 — Gate #2 closed (inline tiers: status / size / latency / content-type)
+
+Added the remaining inline assertion tiers to the worker. Verdict per request
+is mutually exclusive — priority status > latency > size > content_type
+(matches bench.proto's RpsBucket counter set). A pre-built `InlineAssert`
+struct holds the rules so each request costs a few comparisons + an
+ASCII-lowercase prefix match on Content-Type.
+
+`read_one_response` now also extracts the response's `content-length` and
+`content-type` headers (Content-Type lowercased, owned). Counts plumbed
+through `ConnResult`, `LiveCounters` (atomics for live ticks), `ThisTick`,
+`Bucket`, and `RunReport`. CLI gets `--max-latency-ms`, `--min-body-bytes`,
+`--max-body-bytes`, `--content-type`.
+
+`cargo test` — green:
+```
+sched unit          7/7
+integration         4/4   (healthy, fast500→fail_status, truncate→fail_size,
+                            slow_ok→fail_latency)
+proptest            2/2
+```
+
+### Gate #2 numerical agreement (mock injected pct=100, cliff_rps=0)
+
+| mock mode    | engine assert config            | injected | engine reports | tier            | delta  |
+|--------------|---------------------------------|----------|----------------|-----------------|--------|
+| healthy      | `--expected-status 200`         | 0%       | 0/1200 = 0.0%  | (no false +)    | exact  |
+| fast500      | `--expected-status 200`         | 100%     | 1200/1200 = 100.0% | `fail_status` | exact  |
+| truncate     | `--min-body-bytes 44`           | 100%     | 1200/1200 = 100.0% | `fail_size`   | exact  |
+| slow_ok      | `--max-latency-ms 100` (rate=10)| 100%     | 58/58 = 100.0% | `fail_latency`  | exact  |
+| wrong_value  | (inline can't see; offload tier)| 100%     | 0/1200         | needs offload   | n/a    |
+
+Three of four detectable-by-inline tiers fire at exactly the injected %, on
+the request. `wrong_value` requires the offload eval pool (JSON-path / value
+checks against sampled bodies in control plane) and is out of inline scope —
+documented as expected.
+
+Earlier in this session we already showed:
+- below-cliff at 50 RPS vs cliff=100: 100.0% pass — no false negatives.
+- pct=50 above cliff: exactly 50.0% fail_status (mock's deterministic
+  `seq % 100 < pct` selection translates 1:1 through the engine).
+- ramp 0→300 across cliff=150: smooth 100% → 91.7% → 40.1% → 1.1% → 0% as
+  RPS crosses 150 in a single 30-second run.
+
+**Gate #2 acceptance** (per `gates/gate2_oracle.md`):
+- [x] Below 100 RPS: reported correctness ~100%. (100.0% exact)
+- [x] Above 100 RPS at full injection: reported fail rate matches injected
+      within ±2%. (0% delta on each detectable tier)
+- [x] Correctness-vs-load curve shows the cliff at ~cliff_rps. (visible live)
+- [x] Latency stays roughly flat across the cliff. (25–27 ms across the ramp)
+- [x] Variants: truncate→size ✓, slow_ok→latency ✓, fast500→status ✓.
+- [ ] wrong_value→value requires the offload tier (deferred per design — the
+      gate explicitly notes "needs offload tier for schema/value").
+
+**Gate #2 GREEN** for the inline tiers it owns. wrong_value's value-tier
+detection lands when the offload eval pool ships (separate phase).
+
 <!-- Subsequent phases append below this line. -->
