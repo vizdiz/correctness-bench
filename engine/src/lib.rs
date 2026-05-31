@@ -8,6 +8,7 @@ pub mod hist;
 pub mod proto;
 pub mod sched;
 pub mod worker;
+pub mod worker_node;
 
 pub use hist::{Histos, Summary};
 pub use sched::{ConnSched, RateSchedule};
