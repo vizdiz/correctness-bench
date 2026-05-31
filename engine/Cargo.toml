@@ -3,11 +3,17 @@ name = "engine"
 version = "0.1.0"
 edition = "2021"
 publish = false
+build = "build.rs"
 
 # The benchmarker's hot path: COO-correct scheduler, HDR histograms (corrected
-# + uncorrected), open-loop load against any HTTP target. This crate is the
-# gate-#1 owner (gates/gate1_wrk2_agreement.md). The coordinator + gRPC + fleet
-# bits are not in this MVP — single worker, single thread, single binary.
+# + uncorrected), open-loop load against any HTTP target. Gate #1 + #2 owner.
+#
+# Binaries:
+#   engine-worker  — CLI-driven single-worker (the one CLI/MCP fire today)
+#   coordinator    — gRPC server for Bench (Register/Heartbeat); dials
+#                    registered workers' Bench (RunSlice/Abort) to distribute.
+#   worker         — gRPC peer of coordinator: registers on startup, serves
+#                    RunSlice/Abort, runs assigned slices via engine::run_with_ticks.
 
 [lib]
 name = "engine"
