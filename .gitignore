@@ -41,6 +41,9 @@ secrets/
 *.swp
 *~
 
+# ---- Claude Code local-only ----
+.claude/
+
 # ---- Build / validation scratch ----
 /tmp/
 *.descriptor
