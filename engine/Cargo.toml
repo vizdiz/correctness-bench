@@ -28,12 +28,23 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 http = "1"
 httparse = "1"
 hdrhistogram = "7"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 # 1 Hz tick pusher → control plane; not on the hot path.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# gRPC for the worker↔coordinator surface (contracts/bench.proto, FROZEN).
+# prost pinned to tonic 0.13's transitive version so the codec types align.
+tonic = { version = "0.13", default-features = false, features = ["channel", "codegen", "prost", "router", "server", "transport"] }
+prost = "0.13"
+prost-types = "0.13"
+async-stream = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-build = { version = "0.13", default-features = false, features = ["prost"] }
 
 [dev-dependencies]
 proptest = "1"
