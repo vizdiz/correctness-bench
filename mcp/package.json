@@ -1,15 +1,24 @@
 {
   "name": "@correctness-bench/mcp",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "MCP server exposing the benchmarker as agent-callable tools. Thin client of contracts/api.md. Built LAST (stub only).",
+  "description": "MCP server exposing the correctness-bench control plane as agent-callable tools. Thin wrapper over contracts/api.md.",
   "type": "module",
+  "bin": {
+    "correctness-bench-mcp": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "smoke": "node smoke/client.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0"
   }
 }
