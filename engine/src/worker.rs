@@ -65,6 +65,14 @@ pub struct RunSpec {
     /// When true, ramp the offered rate linearly from 0 to `target_rps` over
     /// `duration_s`. Reveals the full cliff curve in a single run.
     pub ramp: bool,
+    /// Offload-sampling cadence. `0` disables sampling. With `N`, the engine
+    /// captures every N-th response body and ships it up (via the Tick stream
+    /// today) for the control plane's offload eval pool to evaluate against
+    /// the schema/path/regex tiers. Matches bench.proto AssertSpec.sample_every_n.
+    pub sample_every_n: u32,
+    /// Cap on the captured body length; truncated beyond. `0` = no cap (not
+    /// recommended for prod).
+    pub max_sampled_body_bytes: u32,
 }
 
 #[derive(Debug)]
@@ -121,6 +129,8 @@ struct InlineAssert {
     max_body_bytes: Option<u64>,
     /// Lower-cased prefix to match against the response's Content-Type.
     content_type_lc_prefix: Option<String>,
+    sample_every_n: u32,
+    max_sampled_body_bytes: u32,
 }
 
 impl InlineAssert {
@@ -131,6 +141,8 @@ impl InlineAssert {
             min_body_bytes: spec.min_body_bytes,
             max_body_bytes: spec.max_body_bytes,
             content_type_lc_prefix: spec.content_type.as_ref().map(|s| s.to_ascii_lowercase()),
+            sample_every_n: spec.sample_every_n,
+            max_sampled_body_bytes: spec.max_sampled_body_bytes,
         }
     }
 
@@ -190,6 +202,9 @@ struct LiveCounters {
     fail_latency: AtomicU64,
     fail_size: AtomicU64,
     fail_content_type: AtomicU64,
+    /// Dedicated counter for the sampling-decision modulus so it stays
+    /// independent of bookkeeping atomics.
+    sample_seq: AtomicU64,
 }
 
 /// One-second snapshot of the run's progress. Shape is a subset of api.md's
@@ -211,6 +226,11 @@ pub struct Tick {
     /// (the bucket containing `achieved_rps_1s`); clients accumulate across
     /// ticks to plot correctness-vs-load.
     pub buckets: Vec<Bucket>,
+    /// Response bodies sampled this tick (per `sample_every_n`), for the
+    /// control plane's offload eval pool to run schema / path / regex tiers on.
+    /// Empty when sampling is disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sampled: Vec<SampledResponse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +269,20 @@ pub struct Bucket {
 
 /// Bucket width on the offered-RPS axis. 10 RPS matches the api.md example.
 const BUCKET_WIDTH_RPS: f64 = 10.0;
+
+/// One sampled response shipped up to the offload eval pool. Matches the
+/// `SampledResponse` shape in bench.proto modulo the headers map (omitted in
+/// v0; the inline content-type tier already runs at fire time).
+#[derive(Debug, Clone, Serialize)]
+pub struct SampledResponse {
+    pub rps_at_send: f64,
+    pub status: u16,
+    pub corrected_lat_us: u64,
+    /// UTF-8 lossy body bytes. JSON-targeted v0; binary bodies will need
+    /// base64 once we ship beyond JSON APIs.
+    pub body: String,
+    pub body_truncated: bool,
+}
 
 /// Tail-wait threshold: above this we sleep, below we spin. With staggered
 /// schedules the runtime rarely has more than one task spinning at a time, so
@@ -330,6 +364,9 @@ pub async fn run_with_ticks(
     // and centralizing lets the tick task and final report read the same source
     // of truth without a per-task merge step.
     let histos = Arc::new(Mutex::new(Histos::new()));
+    // Shared buffer of sampled responses. Conn tasks lock-push when sampling
+    // fires; the tick task drains per second into the Tick payload.
+    let samples_shared: Arc<Mutex<Vec<SampledResponse>>> = Arc::new(Mutex::new(Vec::new()));
 
     let mut joinset: JoinSet<ConnResult> = JoinSet::new();
     for conn_id in 0..spec.connections {
@@ -339,11 +376,12 @@ pub async fn run_with_ticks(
         let assert_rules = assert_rules.clone();
         let counters = counters.clone();
         let histos = histos.clone();
+        let samples = samples_shared.clone();
         let mut rx = worker_start_rx_template.clone();
         let offset_us = conn_id as u64 * stagger_us;
         joinset.spawn(async move {
             connection_task(
-                host, port, req_bytes, assert_rules, counters, histos,
+                host, port, req_bytes, assert_rules, counters, histos, samples,
                 per_conn_schedule, offset_us,
                 spec.duration_s, timeout, barrier, &mut rx,
             )
@@ -360,6 +398,7 @@ pub async fn run_with_ticks(
     let tick_handle = tick_tx.map(|tx| {
         let counters = counters.clone();
         let histos = histos.clone();
+        let samples = samples_shared.clone();
         let duration_s = spec.duration_s;
         tokio::spawn(async move {
             let mut prev_completed = 0u64;
@@ -419,6 +458,9 @@ pub async fn run_with_ticks(
                     fail_content_type: this_tick.fail_content_type,
                 };
 
+                // Drain sampled responses captured this tick.
+                let sampled = std::mem::take(&mut *samples.lock().unwrap());
+
                 if tx
                     .send(Tick {
                         elapsed_s,
@@ -429,6 +471,7 @@ pub async fn run_with_ticks(
                         this_tick,
                         percentiles_so_far,
                         buckets: vec![bucket],
+                        sampled,
                     })
                     .is_err()
                 {
@@ -495,6 +538,7 @@ async fn connection_task(
     assert_rules: Arc<InlineAssert>,
     counters: Arc<LiveCounters>,
     histos: Arc<Mutex<Histos>>,
+    samples: Arc<Mutex<Vec<SampledResponse>>>,
     schedule: RateSchedule,
     offset_us: u64,
     duration_s: u64,
@@ -592,6 +636,34 @@ async fn connection_task(
         }
         res.completed += 1;
         counters.completed.fetch_add(1, Ordering::Relaxed);
+
+        // Offload sampling: capture every Nth response body for the control
+        // plane's offload eval pool.
+        if assert_rules.sample_every_n > 0 {
+            let seq = counters.sample_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            if seq % assert_rules.sample_every_n as u64 == 0 {
+                let body_start = parsed
+                    .msg_len
+                    .saturating_sub(parsed.content_length as usize);
+                let body_end = parsed.msg_len.min(buf.len());
+                let body_slice = &buf[body_start..body_end];
+                let cap = assert_rules.max_sampled_body_bytes as usize;
+                let (slice, truncated) = if cap > 0 && body_slice.len() > cap {
+                    (&body_slice[..cap], true)
+                } else {
+                    (body_slice, false)
+                };
+                let body_str = String::from_utf8_lossy(slice).into_owned();
+                let sample = SampledResponse {
+                    rps_at_send: 0.0, // TODO: real instant rps; needs a rolling 1s meter on the worker
+                    status: parsed.status,
+                    corrected_lat_us: corrected,
+                    body: body_str,
+                    body_truncated: truncated,
+                };
+                samples.lock().unwrap().push(sample);
+            }
+        }
 
         let verdict = assert_rules.classify(
             parsed.status,

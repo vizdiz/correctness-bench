@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,7 +10,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/vizdiz/correctness-bench/control/internal/offload"
 	"github.com/vizdiz/correctness-bench/control/internal/sse"
+	"github.com/vizdiz/correctness-bench/control/internal/store"
 )
 
 // IngestTick accepts a single Tick payload from a worker and fans it out to
@@ -30,8 +33,61 @@ func (s *Server) IngestTick(w http.ResponseWriter, r *http.Request) {
 	}
 	tick.TS = time.Now().UTC()
 	s.Broker.Publish(id, tick)
+
+	// Offload eval: evaluate every sampled body against this run's spec.
+	// Async so the ingest path isn't blocked on the DB write; spawning N
+	// goroutines per tick is fine - sample_every_n caps N in practice.
+	if len(tick.Sampled) > 0 && s.Offload != nil {
+		for _, sample := range tick.Sampled {
+			sample := sample
+			go s.evalOneSample(id, sample)
+		}
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// evalOneSample runs a single sampled response through the offload evaluator
+// and persists the verdict. Errors are logged but never surfaced - the engine
+// shouldn't slow down because the eval pool is unhealthy.
+func (s *Server) evalOneSample(runID string, sample sse.SampledResponse) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	eval, err := s.Offload.Get(ctx, runID)
+	if err != nil {
+		s.Log.Warn("offload spec fetch", "run_id", runID, "err", err.Error())
+		return
+	}
+	if eval == nil {
+		// No offload tier configured for this run - nothing to evaluate.
+		return
+	}
+
+	body := []byte(sample.Body)
+	verdict, details := eval.Evaluate(body)
+	var detailsJSON string
+	if details != "" {
+		j, _ := json.Marshal(map[string]string{"reason": details})
+		detailsJSON = string(j)
+	}
+	if err := s.Store.InsertOffloadVerdict(ctx, store.InsertOffloadVerdictParams{
+		RunID:          runID,
+		RpsAtSend:      sample.RpsAtSend,
+		Status:         int32(sample.Status),
+		CorrectedLatUS: int64(sample.CorrectedLatUS),
+		Verdict:        string(verdict),
+		DetailsJSON:    detailsJSON,
+		BodySize:       int32(len(body)),
+		BodySHA256:     store.SHA256Body(body),
+		Body:           nil, // not retaining bodies by default
+	}); err != nil {
+		s.Log.Warn("offload verdict persist", "run_id", runID, "err", err.Error())
+	}
+}
+
+// suppress unused-import warning if all callers go away in the future.
+var _ = offload.VerdictPass
 
 // StreamRun is the api.md SSE endpoint:
 //   GET /v1/runs/{id}/stream

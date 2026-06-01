@@ -85,6 +85,16 @@ struct Cli {
     /// (e.g. `--content-type application/json` matches `; charset=utf-8`).
     #[arg(long)]
     content_type: Option<String>,
+
+    /// Offload sampling cadence: capture every Nth response body for the
+    /// control plane's offload eval pool (JSON Schema / JSON-path / regex
+    /// tiers). 0 disables. Matches bench.proto AssertSpec.sample_every_n.
+    #[arg(long, default_value_t = 0)]
+    sample_every_n: u32,
+
+    /// Cap on captured body length (bytes); truncated beyond. 0 = no cap.
+    #[arg(long, default_value_t = 8192)]
+    max_sampled_body_bytes: u32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,6 +128,8 @@ fn main() -> anyhow::Result<()> {
             max_body_bytes: cli.max_body_bytes,
             content_type: cli.content_type.clone(),
             ramp: cli.ramp,
+            sample_every_n: cli.sample_every_n,
+            max_sampled_body_bytes: cli.max_sampled_body_bytes,
         };
 
         eprintln!(

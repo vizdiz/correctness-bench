@@ -24,7 +24,20 @@ type Tick struct {
 	ThisTick         ThisTick          `json:"this_tick"`
 	PercentilesSoFar PercentilesSoFar  `json:"percentiles_so_far"`
 	Buckets          []Bucket          `json:"buckets,omitempty"`
+	Sampled          []SampledResponse `json:"sampled,omitempty"`
 	TS               time.Time         `json:"ts,omitempty"` // server-stamped on ingest
+}
+
+// SampledResponse is one captured response body shipped by the worker for the
+// control plane's offload eval pool. Shape matches what engine emits today.
+type SampledResponse struct {
+	RpsAtSend      float64 `json:"rps_at_send"`
+	Status         uint16  `json:"status"`
+	CorrectedLatUS uint64  `json:"corrected_lat_us"`
+	// Body is UTF-8 lossy JSON-ish today; binary needs base64 once we ship
+	// beyond JSON APIs.
+	Body          string `json:"body"`
+	BodyTruncated bool   `json:"body_truncated"`
 }
 
 // Bucket is one per-RPS correctness bucket. api.md SSE tick `buckets` entry.

@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use http::{Method, Uri};
 
-use engine::worker::{run, RunSpec};
+use engine::worker::{run, run_with_ticks, RunSpec, Tick};
+use tokio::sync::mpsc;
 
 async fn spawn_mock() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -41,6 +42,8 @@ async fn engine_hits_target_rps_against_healthy_mock() {
         max_body_bytes: None,
         content_type: None,
         ramp: false,
+        sample_every_n: 0,
+        max_sampled_body_bytes: 0,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -106,6 +109,8 @@ async fn status_tier_assertion_catches_fast500() {
         max_body_bytes: None,
         content_type: None,
         ramp: false,
+        sample_every_n: 0,
+        max_sampled_body_bytes: 0,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -144,6 +149,8 @@ async fn size_tier_assertion_catches_truncate() {
         max_body_bytes: None,
         content_type: None,
         ramp: false,
+        sample_every_n: 0,
+        max_sampled_body_bytes: 0,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -182,6 +189,8 @@ async fn latency_tier_assertion_catches_slow_ok() {
         max_body_bytes: None,
         content_type: None,
         ramp: false,
+        sample_every_n: 0,
+        max_sampled_body_bytes: 0,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -194,4 +203,53 @@ async fn latency_tier_assertion_catches_slow_ok() {
         report.fail_latency, report.completed
     );
     assert_eq!(report.pass, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offload_sampling_captures_bodies_at_the_configured_cadence() {
+    // Sample every 10th response; over 3 s at 200 RPS we expect roughly
+    // 600/10 = 60 samples. Each sample's body is the mock's healthy JSON.
+    let addr = spawn_mock().await;
+    let url = Uri::try_from(format!(
+        "http://{addr}/api?mode=healthy&base_latency_ms=5"
+    ))
+    .unwrap();
+
+    let spec = RunSpec {
+        url,
+        method: Method::GET,
+        target_rps: 200.0,
+        duration_s: 3,
+        connections: 10,
+        keepalive: true,
+        timeout: Duration::from_secs(3),
+        expected_status: vec![200],
+        max_latency_us: None,
+        min_body_bytes: None,
+        max_body_bytes: None,
+        content_type: None,
+        ramp: false,
+        sample_every_n: 10,
+        max_sampled_body_bytes: 4096,
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Tick>();
+    let _report = run_with_ticks(spec, Some(tx)).await.expect("run completed");
+
+    let mut total_sampled = 0usize;
+    let mut any_body = String::new();
+    while let Ok(t) = rx.try_recv() {
+        total_sampled += t.sampled.len();
+        if let Some(s) = t.sampled.first() {
+            any_body = s.body.clone();
+        }
+    }
+    assert!(
+        total_sampled >= 40 && total_sampled <= 80,
+        "expected ~60 samples (200rps * 3s / 10), got {total_sampled}",
+    );
+    assert!(
+        any_body.starts_with("{\"status\":\"ok\","),
+        "sampled body looks wrong: {any_body:?}",
+    );
 }

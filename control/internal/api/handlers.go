@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/vizdiz/correctness-bench/control/internal/offload"
 	"github.com/vizdiz/correctness-bench/control/internal/sse"
 	"github.com/vizdiz/correctness-bench/control/internal/store"
 )
@@ -20,16 +22,24 @@ import (
 // Server holds handler dependencies. The logger is deliberately only ever given
 // non-secret fields — target headers and bodies never pass through it.
 type Server struct {
-	Store  *store.Store
-	Log    *slog.Logger
-	Broker *sse.Broker
+	Store   *store.Store
+	Log     *slog.Logger
+	Broker  *sse.Broker
+	Offload *offload.Cache
 }
 
 func NewServer(s *store.Store, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{Store: s, Log: log, Broker: sse.NewBroker()}
+	cache := offload.NewCache(func(ctx context.Context, runID string) (offload.Spec, error) {
+		raw, err := s.GetAssertSpec(ctx, runID)
+		if err != nil {
+			return offload.Spec{}, err
+		}
+		return offload.ParseSpecFromAssert(raw)
+	})
+	return &Server{Store: s, Log: log, Broker: sse.NewBroker(), Offload: cache}
 }
 
 const maxBodyBytes = 1 << 20 // 1 MiB cap on the POST /v1/runs JSON

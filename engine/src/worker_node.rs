@@ -152,6 +152,8 @@ fn build_run_spec(a: &Assignment) -> Result<RunSpec, String> {
         max_body_bytes,
         content_type,
         ramp: false,
+        sample_every_n: 0,
+        max_sampled_body_bytes: 0,
     })
 }
 
