@@ -8,6 +8,8 @@
 //! No external service discovery (Consul/etcd/k8s) — workers POST register
 //! on startup, heartbeats handle liveness.
 
+pub mod dispatch;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
