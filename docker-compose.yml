@@ -88,21 +88,39 @@ services:
     networks: [bench]
     depends_on: [mock]
 
-  # ---- SUPERVISED ENGINE WORK (do not uncomment until built with a human) ----
-  # coordinator:
-  #   build: { context: ./engine, dockerfile: Dockerfile.coordinator }
-  #   environment:
-  #     CONTROL_URL: "http://control:8000"
-  #   networks: [bench]
-  #
-  # worker:
-  #   build: { context: ./engine, dockerfile: Dockerfile.worker }
-  #   environment:
-  #     COORDINATOR_URL: "coordinator:9090"
-  #   deploy:
-  #     replicas: 4   # default fleet size (design §13)
-  #   depends_on: [coordinator]
-  #   networks: [bench]
+  # ---- ENGINE FLEET (gRPC coordinator + worker_node replicas) ----
+  # Two binaries baked into the engine image; entrypoint picks one.
+  coordinator:
+    build: { context: ., dockerfile: engine/Dockerfile }
+    image: correctness-bench-engine
+    entrypoint: ["/usr/local/bin/coordinator"]
+    command: ["--grpc-addr", "0.0.0.0:9090", "--admin-addr", "0.0.0.0:9091"]
+    ports:
+      - "9091:9091"   # admin HTTP only; gRPC is internal to the bench network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9091/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    networks: [bench]
+
+  worker_node:
+    build: { context: ., dockerfile: engine/Dockerfile }
+    image: correctness-bench-engine
+    entrypoint: ["/usr/local/bin/worker_node"]
+    command: [
+      "--coord", "http://coordinator:9090",
+      "--listen", "0.0.0.0:9092",
+    ]
+    # WORKER_ADDRESS is derived from $HOSTNAME by the binary (compose gives
+    # each replica a unique DNS-resolvable name on the bench network), so
+    # peers reach us via correctness-bench-worker_node-1:9092, etc.
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    deploy:
+      replicas: 2   # docker compose up --scale worker_node=N to vary
+    networks: [bench]
 
 volumes:
   pgdata:

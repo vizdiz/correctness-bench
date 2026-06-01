@@ -8,6 +8,7 @@
 //! No external service discovery (Consul/etcd/k8s) — workers POST register
 //! on startup, heartbeats handle liveness.
 
+pub mod admin;
 pub mod dispatch;
 
 use std::collections::HashMap;

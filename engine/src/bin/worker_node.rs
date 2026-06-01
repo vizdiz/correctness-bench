@@ -54,9 +54,21 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let worker_id = cli.worker_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let address = cli.address.unwrap_or_else(|| cli.listen.to_string());
+    // If --address is unset and we're listening on 0.0.0.0 (the compose case),
+    // build a routable address from $HOSTNAME so peers can dial us back.
+    let address = cli.address.unwrap_or_else(|| {
+        if cli.listen.ip().is_unspecified() {
+            let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "127.0.0.1".to_string());
+            format!("{}:{}", host, cli.listen.port())
+        } else {
+            cli.listen.to_string()
+        }
+    });
 
-    eprintln!("worker_node: worker_id={} listen={} coord={}", worker_id, cli.listen, cli.coord);
+    eprintln!(
+        "worker_node: worker_id={} listen={} address={} coord={}",
+        worker_id, cli.listen, address, cli.coord,
+    );
 
     // Register first, then start serving. The coordinator will dial back when
     // it wants to assign a slice, so it must be able to reach `address`.
