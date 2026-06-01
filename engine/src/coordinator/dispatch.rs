@@ -4,9 +4,12 @@
 //! the live per-tick push to control and HDR percentile merge are layered on
 //! top in follow-up work.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tonic::transport::Endpoint;
 
@@ -14,7 +17,8 @@ use crate::coordinator::{CoordinatorState, CONTRACT_VERSION};
 use crate::proto::bench::bench_client::BenchClient;
 use crate::proto::bench::worker_event::Kind as WorkerEventKind;
 use crate::proto::bench::{
-    AssertSpec, Assignment, HttpMethod, LoadModel, RateLimitAction, RateLimitPolicy, Target,
+    AssertSpec, Assignment, HttpMethod, LoadModel, Partial, RateLimitAction, RateLimitPolicy,
+    Target,
 };
 
 /// Input to `dispatch`. Mirrors the slice of api.md's run spec the engine
@@ -66,9 +70,72 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
+/// One per-second aggregated tick, summed across every worker that reported
+/// at that tick number. Shape mirrors the JSON the control plane's tick broker
+/// already accepts (engine -> POST /v1/_internal/runs/:id/tick) so the
+/// coordinator can pipe these straight into the same surface.
+///
+/// `percentiles_so_far` is currently {0,0} - the proto's HDR `corrected_hist`
+/// bytes are still empty (engine -> Partial mapping). True percentile merge
+/// across workers needs HDR V2 serialization in the worker -> coordinator
+/// stream; tracked for a follow-up.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregatedTick {
+    pub elapsed_s: u64,
+    pub achieved_rps_1s: f64,
+    pub completed_total: u64,
+    pub pass_total: u64,
+    pub fail_status_total: u64,
+    pub this_tick: AggThisTick,
+    pub percentiles_so_far: AggPercentiles,
+    pub buckets: Vec<AggBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AggThisTick {
+    pub total: u64,
+    pub pass: u64,
+    pub fail_status: u64,
+    pub fail_latency: u64,
+    pub fail_size: u64,
+    pub fail_content_type: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AggPercentiles {
+    pub p50_us: u64,
+    pub p99_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AggBucket {
+    pub rps_lo: f64,
+    pub rps_hi: f64,
+    pub total: u64,
+    pub pass: u64,
+    pub fail_status: u64,
+    pub fail_latency: u64,
+    pub fail_size: u64,
+    pub fail_content_type: u64,
+}
+
+/// Dispatch a run without live ticks. Returns the final aggregated totals.
 pub async fn dispatch(
     state: Arc<CoordinatorState>,
     spec: DispatchSpec,
+) -> Result<DispatchSummary, DispatchError> {
+    dispatch_with_ticks(state, spec, None).await
+}
+
+/// Dispatch a run with optional live per-tick aggregation streamed via `tick_tx`.
+/// Emits one [`AggregatedTick`] per global tick number once EVERY worker has
+/// reported that tick. (If a worker dies mid-run, ticks past its last report
+/// are silently dropped; the final per-worker totals still go into the
+/// returned [`DispatchSummary`] via each worker task's own counts.)
+pub async fn dispatch_with_ticks(
+    state: Arc<CoordinatorState>,
+    spec: DispatchSpec,
+    tick_tx: Option<UnboundedSender<AggregatedTick>>,
 ) -> Result<DispatchSummary, DispatchError> {
     let workers = state.list_workers().await;
     if workers.is_empty() {
@@ -82,6 +149,10 @@ pub async fn dispatch(
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
 
+    // Each worker task sends (worker_id, Partial) into this channel.
+    let (partial_tx, partial_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Partial)>();
+
     let mut handles: Vec<JoinHandle<WorkerSummary>> = Vec::new();
     for w in workers.iter() {
         let assignment = build_assignment(&spec, &w.worker_id, per_worker_rps, epoch_unix_us);
@@ -90,9 +161,17 @@ pub async fn dispatch(
         } else {
             format!("http://{}", w.address)
         };
-        handles.push(tokio::spawn(run_one_worker(worker_url, assignment)));
+        let tx = partial_tx.clone();
+        let worker_id = w.worker_id.clone();
+        handles.push(tokio::spawn(run_one_worker(worker_url, worker_id, assignment, tx)));
     }
+    drop(partial_tx);
 
+    // Live per-tick aggregator.
+    aggregate_loop(partial_rx, tick_tx, num_workers).await;
+
+    // Final per-tier totals: sum each worker task's own counts (independent of
+    // the per-tick aggregation, which may drop ticks if a worker dies mid-run).
     let mut summary = DispatchSummary {
         workers_dispatched: num_workers,
         ..Default::default()
@@ -100,7 +179,7 @@ pub async fn dispatch(
     for h in handles {
         let ws = match h.await {
             Ok(s) => s,
-            Err(_) => continue, // task panicked
+            Err(_) => continue,
         };
         if ws.finished {
             summary.workers_finished += 1;
@@ -126,7 +205,12 @@ struct WorkerSummary {
     fail_content_type: u64,
 }
 
-async fn run_one_worker(worker_url: String, assignment: Assignment) -> WorkerSummary {
+async fn run_one_worker(
+    worker_url: String,
+    worker_id: String,
+    assignment: Assignment,
+    partial_tx: tokio::sync::mpsc::UnboundedSender<(String, Partial)>,
+) -> WorkerSummary {
     let mut s = WorkerSummary::default();
     let endpoint = match Endpoint::from_shared(worker_url) {
         Ok(e) => e.connect_timeout(Duration::from_secs(5)),
@@ -155,9 +239,130 @@ async fn run_one_worker(worker_url: String, assignment: Assignment) -> WorkerSum
             if p.r#final {
                 s.finished = true;
             }
+            // Forward to aggregator (drops if the receiver is gone).
+            let _ = partial_tx.send((worker_id.clone(), p));
         }
     }
     s
+}
+
+/// Per-tick aggregator. Buckets per-worker Partials by tick number; when all
+/// `num_workers` have reported a given tick, sums them and emits a single
+/// AggregatedTick. Closes when every worker's send half drops.
+async fn aggregate_loop(
+    mut partial_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Partial)>,
+    tick_tx: Option<UnboundedSender<AggregatedTick>>,
+    num_workers: usize,
+) {
+    let mut per_tick: HashMap<u64, HashMap<String, Partial>> = HashMap::new();
+    let mut cum_completed = 0u64;
+    let mut cum_pass = 0u64;
+    let mut cum_fail_status = 0u64;
+    while let Some((worker_id, p)) = partial_rx.recv().await {
+        if p.r#final {
+            continue;
+        }
+        let tick_n = p.tick;
+        let entry = per_tick.entry(tick_n).or_default();
+        entry.insert(worker_id, p);
+        if entry.len() == num_workers {
+            // Drain this tick's partials and aggregate.
+            let bucket = per_tick.remove(&tick_n).unwrap();
+            let agg = aggregate_tick(
+                tick_n,
+                bucket.values(),
+                &mut cum_completed,
+                &mut cum_pass,
+                &mut cum_fail_status,
+            );
+            if let Some(tx) = tick_tx.as_ref() {
+                let _ = tx.send(agg);
+            }
+        }
+    }
+}
+
+fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
+    tick_n: u64,
+    partials: I,
+    cum_completed: &mut u64,
+    cum_pass: &mut u64,
+    cum_fail_status: &mut u64,
+) -> AggregatedTick {
+    let mut this = AggThisTick {
+        total: 0,
+        pass: 0,
+        fail_status: 0,
+        fail_latency: 0,
+        fail_size: 0,
+        fail_content_type: 0,
+    };
+    let mut achieved_rps_1s = 0.0_f64;
+    // Sum each worker's buckets into one combined Bucket for this tick.
+    // Single bucket per tick today (matches engine's emission shape).
+    let mut combined: Option<AggBucket> = None;
+    for p in partials {
+        achieved_rps_1s += p.achieved_rps;
+        for b in &p.buckets {
+            this.total += b.total;
+            this.pass += b.pass;
+            this.fail_status += b.fail_status;
+            this.fail_latency += b.fail_latency;
+            this.fail_size += b.fail_size;
+            this.fail_content_type += b.fail_content_type;
+            combined = Some(match combined.take() {
+                None => AggBucket {
+                    rps_lo: b.rps_lo,
+                    rps_hi: b.rps_hi,
+                    total: b.total,
+                    pass: b.pass,
+                    fail_status: b.fail_status,
+                    fail_latency: b.fail_latency,
+                    fail_size: b.fail_size,
+                    fail_content_type: b.fail_content_type,
+                },
+                Some(mut acc) => {
+                    acc.total += b.total;
+                    acc.pass += b.pass;
+                    acc.fail_status += b.fail_status;
+                    acc.fail_latency += b.fail_latency;
+                    acc.fail_size += b.fail_size;
+                    acc.fail_content_type += b.fail_content_type;
+                    acc
+                }
+            });
+        }
+    }
+    *cum_completed += this.total;
+    *cum_pass += this.pass;
+    *cum_fail_status += this.fail_status;
+    // Re-bucket onto the AGGREGATE RPS axis (10 RPS wide), matching engine's
+    // emission convention; the worker-local bucket edges may differ if each
+    // worker's per-worker RPS slice doesn't land on a clean boundary.
+    let agg_lo = (achieved_rps_1s / 10.0).floor() * 10.0;
+    let buckets = vec![AggBucket {
+        rps_lo: agg_lo,
+        rps_hi: agg_lo + 10.0,
+        total: this.total,
+        pass: this.pass,
+        fail_status: this.fail_status,
+        fail_latency: this.fail_latency,
+        fail_size: this.fail_size,
+        fail_content_type: this.fail_content_type,
+    }];
+    // `combined` is currently unused since we re-bucket on the aggregate axis;
+    // kept here as a hook for when worker-local buckets matter (mixed loads).
+    let _ = combined;
+    AggregatedTick {
+        elapsed_s: tick_n,
+        achieved_rps_1s,
+        completed_total: *cum_completed,
+        pass_total: *cum_pass,
+        fail_status_total: *cum_fail_status,
+        this_tick: this,
+        percentiles_so_far: AggPercentiles::default(),
+        buckets,
+    }
 }
 
 fn build_assignment(

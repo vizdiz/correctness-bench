@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use super::dispatch::{dispatch, DispatchError, DispatchSpec, DispatchSummary};
+use super::dispatch::{dispatch_with_ticks, AggregatedTick, DispatchError, DispatchSpec, DispatchSummary};
 use super::{CoordinatorState, Worker};
 
 #[derive(Clone)]
@@ -46,6 +46,10 @@ pub struct RunRequest {
     pub min_body_bytes: Option<i32>,
     pub max_body_bytes: Option<i32>,
     pub content_type: Option<String>,
+    /// Where to POST aggregated per-second ticks. Typically
+    /// `http://control:8000/v1/_internal/runs/{run_id}/tick`. If omitted, no
+    /// live ticks are pushed (the final summary is still returned).
+    pub control_tick_url: Option<String>,
 }
 
 fn default_method() -> String { "GET".into() }
@@ -128,7 +132,28 @@ async fn run_endpoint(
         content_type: req.content_type,
     };
 
-    match dispatch(state.coord.clone(), spec).await {
+    // Optional live tick pusher: if a control_tick_url is supplied, drain
+    // aggregated ticks and POST each as JSON.
+    let (tick_tx, push_handle) = match req.control_tick_url.as_ref() {
+        Some(url) => {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AggregatedTick>();
+            let url = url.clone();
+            let handle = tokio::spawn(async move {
+                let http = reqwest::Client::new();
+                while let Some(tick) = rx.recv().await {
+                    let _ = http.post(&url).json(&tick).send().await;
+                }
+            });
+            (Some(tx), Some(handle))
+        }
+        None => (None, None),
+    };
+
+    let result = dispatch_with_ticks(state.coord.clone(), spec, tick_tx).await;
+    if let Some(h) = push_handle {
+        let _ = h.await;
+    }
+    match result {
         Ok(summary) => Ok(Json(to_response(req.run_id, summary))),
         Err(DispatchError::NoWorkers) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
