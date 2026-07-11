@@ -53,6 +53,37 @@ export interface RunView {
   started_at?: string
   completed_at?: string
   elapsed_s?: number
+  offload?: OffloadCounts
+  final?: FinalsView
+  cost_per_request_usd?: number
+}
+
+export interface OffloadCounts {
+  pass: number
+  fail_schema: number
+  fail_value: number
+  fail_regex: number
+}
+
+export interface FinalsView {
+  corrected: { p50_us: number; p95_us: number; p99_us: number; p999_us?: number }
+  total_requests: number
+  total_pass: number
+  correctness_pct: number
+  cliff_rps?: number
+}
+
+export interface CompareResponse {
+  a: RunView
+  b: RunView
+  winner_by: {
+    latency_p99: 'a' | 'b' | ''
+    correctness: 'a' | 'b' | ''
+    cost_per_request: 'a' | 'b' | ''
+    tail_stability: 'a' | 'b' | ''
+    rate_limit_onset: 'a' | 'b' | ''
+  }
+  fairness: { interleaved: boolean; same_assert_spec: boolean; same_load_shape: boolean }
 }
 
 export interface RunSummary {
@@ -151,4 +182,65 @@ export const api = {
 
   abortRun: (id: string) =>
     req<{ status: string; aborted_at: string }>(`/v1/runs/${id}/abort`, { method: 'POST' }),
+
+  compare: (idA: string, idB: string) =>
+    req<CompareResponse>(`/v1/runs/${idA}/compare/${idB}`),
+
+  regressionCheck: (
+    candidateID: string,
+    baselineID: string,
+    thresholds: { p99_delta_pct: number; correctness_delta_pct: number },
+  ) =>
+    req<RegressionResponse>(`/v1/runs/${candidateID}/regression-check`, {
+      method: 'POST',
+      body: JSON.stringify({ baseline_run_id: baselineID, thresholds }),
+    }),
+
+  listTemplates: () => req<{ templates: TemplateView[] }>('/v1/templates'),
+  createTemplate: (body: { name: string; spec: CreateRunRequest }) =>
+    req<TemplateView>('/v1/templates', { method: 'POST', body: JSON.stringify(body) }),
+  runTemplate: (id: string, body: RunFromTemplateRequest = {}) =>
+    req<CreateRunResponse>(`/v1/templates/${id}/run`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  histogramJSON: (id: string, which: 'corrected' | 'uncorrected' = 'corrected') =>
+    req<HistogramJSON>(
+      `/v1/runs/${id}/histogram?format=json&which=${which}`,
+    ),
+}
+
+export interface TemplateView {
+  id: string
+  name: string
+  spec: CreateRunRequest
+  created_at: string
+  last_used_at?: string
+}
+
+export interface RunFromTemplateRequest {
+  name?: string
+  headers?: Record<string, string>
+  target_rps?: number
+  duration_s?: number
+}
+
+export interface HistogramJSON {
+  bins: { lo_us: number; hi_us: number; count: number }[]
+  p50_us: number
+  p95_us: number
+  p99_us: number
+  p999_us: number
+  total: number
+  min_us: number
+  max_us: number
+}
+
+export interface RegressionResponse {
+  passed: boolean
+  p99_delta_pct: number
+  correctness_delta_pct: number
+  cliff_rps_delta: number
+  details: string
 }

@@ -41,6 +41,7 @@ export function Layout({ children }: { children: ReactNode }) {
         <nav className="flex flex-col gap-0.5">
           <NavItem to="/runs" label="Runs" />
           <NavItem to="/runs/new" label="New run" />
+          <NavItem to="/templates" label="Templates" />
         </nav>
         <div className="mt-auto px-2 text-xs leading-relaxed text-text-faint">
           Correctness as a function of load. The cliff is the headline.

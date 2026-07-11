@@ -6,12 +6,17 @@ import { Card, CardBody, CardHeader } from '../components/ui/Card'
 import { NumberDisplay } from '../components/ui/NumberDisplay'
 import { StatusBadge } from '../components/ui/StatusBadge'
 import { HeadlineChart } from '../components/charts/HeadlineChart'
+import { HistogramChart } from '../components/charts/HistogramChart'
+import { TimeSeriesChart } from '../components/charts/TimeSeriesChart'
 import { int, round, usToMs } from '../lib/format'
 
 const terminal = new Set(['completed', 'failed', 'aborted'])
 const MAX_TICKS_HISTORY = 120
 
+type ChartTab = 'headline' | 'histogram' | 'time-series'
+
 export function RunDetail() {
+  const [chartTab, setChartTab] = useState<ChartTab>('headline')
   const { id = '' } = useParams()
   const [run, setRun] = useState<RunView | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -143,21 +148,53 @@ export function RunDetail() {
         </CardBody>
       </Card>
 
-      {/* Headline chart: correctness vs offered RPS (green, left axis) +
-          corrected p99 latency (blue, right axis). One screenshot of the
-          product's pitch — green cliffs while blue stays flat. */}
+      {/* Tabbed chart panel. Headline is the pitch (cliff + flat latency).
+          Histogram is tail-stability. Time-series is worker desync + ramp. */}
       <Card>
         <CardHeader
-          title="Correctness vs load"
+          title={
+            chartTab === 'headline'
+              ? 'Correctness vs load'
+              : chartTab === 'histogram'
+              ? 'Latency distribution'
+              : 'Per-tick over time'
+          }
           subtitle={
             ticks.length > 0
               ? `${ticks.length} live tick(s) · pass=${latest?.pass_total} fail_status=${latest?.fail_status_total}`
-              : 'Latency flat (blue, right axis) while correctness cliffs (green, left axis). Live via SSE.'
+              : 'Live via SSE - start an engine worker pushing to this run.'
+          }
+          actions={
+            <div className="inline-flex rounded-md border border-border bg-surface-2/30 p-0.5 text-xs">
+              {(
+                [
+                  ['headline', 'Cliff'],
+                  ['histogram', 'Histogram'],
+                  ['time-series', 'Time'],
+                ] as [ChartTab, string][]
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setChartTab(k)}
+                  className={`rounded px-2.5 py-1 transition-colors ${
+                    chartTab === k
+                      ? 'bg-accent/15 text-accent'
+                      : 'text-text-faint hover:text-text-muted'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           }
         />
         <CardBody>
           <div className="flex justify-center">
-            <HeadlineChart ticks={ticks} />
+            {chartTab === 'headline' && <HeadlineChart ticks={ticks} />}
+            {chartTab === 'histogram' && (
+              <HistogramChart runId={id} ticks={ticks} finals={run.final} />
+            )}
+            {chartTab === 'time-series' && <TimeSeriesChart ticks={ticks} />}
           </div>
         </CardBody>
       </Card>
