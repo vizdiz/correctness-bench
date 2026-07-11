@@ -231,6 +231,18 @@ pub struct Tick {
     /// Empty when sampling is disabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sampled: Vec<SampledResponse>,
+    /// V2-deflate serialized snapshot of the corrected histogram as of this
+    /// tick. Used by the coordinator to merge HDRs across workers losslessly
+    /// (closes gate #3). Skipped from JSON because the control plane already
+    /// gets `percentiles_so_far`; this is for the in-process engine ->
+    /// worker_node channel and the worker_node -> coordinator gRPC bytes.
+    #[serde(skip, default)]
+    pub corrected_hist_v2: Vec<u8>,
+    /// Uncorrected sibling of `corrected_hist_v2`. Same channel, used by the
+    /// coordinator to derive the COO-delta on finalized runs without losing
+    /// the per-worker shape.
+    #[serde(skip, default)]
+    pub uncorrected_hist_v2: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +314,17 @@ pub async fn run(spec: RunSpec) -> anyhow::Result<RunReport> {
 /// Drive the spec to completion. If `tick_tx` is provided, a background
 /// task emits a [`Tick`] event each second containing cumulative counters and
 /// the last-second achieved RPS.
+#[tracing::instrument(
+    name = "engine.run_with_ticks",
+    level = "info",
+    skip(spec, tick_tx),
+    fields(
+        target_rps = spec.target_rps,
+        duration_s = spec.duration_s,
+        connections = spec.connections,
+        url = %spec.url,
+    ),
+)]
 pub async fn run_with_ticks(
     spec: RunSpec,
     tick_tx: Option<mpsc::UnboundedSender<Tick>>,
@@ -434,14 +457,21 @@ pub async fn run_with_ticks(
                 prev_fail_size = fz;
                 prev_fail_content_type = fct;
 
-                // Snapshot percentiles under the lock. Brief — value_at_quantile
-                // is O(buckets) but bounded by HDR's structure (~hundreds).
-                let percentiles_so_far = {
+                // Snapshot percentiles + a V2-deflate copy of the corrected
+                // histogram under the lock. Percentile reads are O(buckets) and
+                // serialize is O(non-empty buckets); both are bounded and brief.
+                // The bytes ride along on the in-process Tick and only get put
+                // on the wire by worker_node -> coordinator (proto bytes), not
+                // by the JSON push to control.
+                let (percentiles_so_far, corrected_hist_v2, uncorrected_hist_v2) = {
                     let h = histos.lock().unwrap();
-                    PercentilesSoFar {
+                    let p = PercentilesSoFar {
                         p50_us: h.corrected.value_at_quantile(0.5),
                         p99_us: h.corrected.value_at_quantile(0.99),
-                    }
+                    };
+                    let c = crate::hist::serialize_v2(&h.corrected);
+                    let u = crate::hist::serialize_v2(&h.uncorrected);
+                    (p, c, u)
                 };
 
                 // Bucket this tick onto the offered-RPS axis. Clients sum
@@ -472,6 +502,8 @@ pub async fn run_with_ticks(
                         percentiles_so_far,
                         buckets: vec![bucket],
                         sampled,
+                        corrected_hist_v2,
+                        uncorrected_hist_v2,
                     })
                     .is_err()
                 {

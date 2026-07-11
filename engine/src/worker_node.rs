@@ -57,11 +57,22 @@ impl Bench for WorkerNodeService {
     type RunSliceStream =
         Pin<Box<dyn Stream<Item = Result<WorkerEvent, Status>> + Send>>;
 
+    #[tracing::instrument(
+        name = "worker_node.run_slice",
+        level = "info",
+        skip(self, req),
+        fields(run_id = tracing::field::Empty, worker_id = tracing::field::Empty),
+    )]
     async fn run_slice(
         &self,
         req: Request<Assignment>,
     ) -> Result<Response<Self::RunSliceStream>, Status> {
         let a = req.into_inner();
+        {
+            let span = tracing::Span::current();
+            span.record("run_id", &a.run_id.as_str());
+            span.record("worker_id", &self.worker_id.as_str());
+        }
         let spec = build_run_spec(&a).map_err(|e| Status::invalid_argument(e.to_string()))?;
         let worker_id = self.worker_id.clone();
 
@@ -190,8 +201,8 @@ fn partial_from_tick(worker_id: &str, tick_n: u64, is_final: bool, t: &Tick) -> 
         worker_id: worker_id.to_string(),
         tick: tick_n,
         r#final: is_final,
-        corrected_hist: vec![],
-        uncorrected_hist: vec![],
+        corrected_hist: t.corrected_hist_v2.clone(),
+        uncorrected_hist: t.uncorrected_hist_v2.clone(),
         ttfb_hist: vec![],
         this_tick_corrected: vec![],
         buckets,

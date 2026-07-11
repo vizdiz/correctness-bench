@@ -75,10 +75,10 @@ impl std::error::Error for DispatchError {}
 /// already accepts (engine -> POST /v1/_internal/runs/:id/tick) so the
 /// coordinator can pipe these straight into the same surface.
 ///
-/// `percentiles_so_far` is currently {0,0} - the proto's HDR `corrected_hist`
-/// bytes are still empty (engine -> Partial mapping). True percentile merge
-/// across workers needs HDR V2 serialization in the worker -> coordinator
-/// stream; tracked for a follow-up.
+/// `percentiles_so_far` is merged across every worker's V2-deflate HDR
+/// snapshot (`Partial.corrected_hist`) for this tick. If a worker's bytes are
+/// missing or malformed, that worker is excluded from the merge for that tick;
+/// the field falls back to {0,0} when no worker shipped a parseable snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub struct AggregatedTick {
     pub elapsed_s: u64,
@@ -89,6 +89,17 @@ pub struct AggregatedTick {
     pub this_tick: AggThisTick,
     pub percentiles_so_far: AggPercentiles,
     pub buckets: Vec<AggBucket>,
+    /// V2-deflate of the merged corrected HDR for this tick across all
+    /// workers. Skipped from JSON (control gets `percentiles_so_far` and the
+    /// raw bytes ride only on the in-process channel + the admin /finalize
+    /// push). Empty when no worker shipped a parseable snapshot this tick.
+    #[serde(skip, default)]
+    pub merged_hist_v2: Vec<u8>,
+    /// V2-deflate of the merged uncorrected HDR for this tick. Same
+    /// transport rules as `merged_hist_v2`; used to ship the COO-delta on
+    /// finalized fleet runs.
+    #[serde(skip, default)]
+    pub merged_uncorrected_hist_v2: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +115,7 @@ pub struct AggThisTick {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AggPercentiles {
     pub p50_us: u64,
+    pub p95_us: u64,
     pub p99_us: u64,
 }
 
@@ -132,6 +144,16 @@ pub async fn dispatch(
 /// reported that tick. (If a worker dies mid-run, ticks past its last report
 /// are silently dropped; the final per-worker totals still go into the
 /// returned [`DispatchSummary`] via each worker task's own counts.)
+#[tracing::instrument(
+    name = "coordinator.dispatch",
+    level = "info",
+    skip(state, spec, tick_tx),
+    fields(
+        run_id = %spec.run_id,
+        target_rps = spec.target_rps,
+        duration_s = spec.duration_s,
+    ),
+)]
 pub async fn dispatch_with_ticks(
     state: Arc<CoordinatorState>,
     spec: DispatchSpec,
@@ -205,6 +227,12 @@ struct WorkerSummary {
     fail_content_type: u64,
 }
 
+#[tracing::instrument(
+    name = "coordinator.run_one_worker",
+    level = "info",
+    skip(assignment, partial_tx),
+    fields(worker_id, worker_url, run_id = %assignment.run_id),
+)]
 async fn run_one_worker(
     worker_url: String,
     worker_id: String,
@@ -301,7 +329,23 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
     // Sum each worker's buckets into one combined Bucket for this tick.
     // Single bucket per tick today (matches engine's emission shape).
     let mut combined: Option<AggBucket> = None;
+    // HDR merge targets — same bounds as engine::hist so add() succeeds without
+    // auto-resize. Workers that ship empty / malformed bytes are skipped.
+    let mut merged_hist = crate::hist::new_corrected_target();
+    let mut merged_uncorrected = crate::hist::new_corrected_target();
+    let mut merged_any = false;
+    let mut merged_uncorrected_any = false;
     for p in partials {
+        if let Some(h) = crate::hist::deserialize_v2(&p.corrected_hist) {
+            if merged_hist.add(&h).is_ok() {
+                merged_any = true;
+            }
+        }
+        if let Some(h) = crate::hist::deserialize_v2(&p.uncorrected_hist) {
+            if merged_uncorrected.add(&h).is_ok() {
+                merged_uncorrected_any = true;
+            }
+        }
         achieved_rps_1s += p.achieved_rps;
         for b in &p.buckets {
             this.total += b.total;
@@ -353,6 +397,22 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
     // `combined` is currently unused since we re-bucket on the aggregate axis;
     // kept here as a hook for when worker-local buckets matter (mixed loads).
     let _ = combined;
+    let (percentiles_so_far, merged_hist_v2) = if merged_any {
+        let pct = AggPercentiles {
+            p50_us: merged_hist.value_at_quantile(0.5),
+            p95_us: merged_hist.value_at_quantile(0.95),
+            p99_us: merged_hist.value_at_quantile(0.99),
+        };
+        let bytes = crate::hist::serialize_v2(&merged_hist);
+        (pct, bytes)
+    } else {
+        (AggPercentiles::default(), Vec::new())
+    };
+    let merged_uncorrected_hist_v2 = if merged_uncorrected_any {
+        crate::hist::serialize_v2(&merged_uncorrected)
+    } else {
+        Vec::new()
+    };
     AggregatedTick {
         elapsed_s: tick_n,
         achieved_rps_1s,
@@ -360,8 +420,10 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
         pass_total: *cum_pass,
         fail_status_total: *cum_fail_status,
         this_tick: this,
-        percentiles_so_far: AggPercentiles::default(),
+        percentiles_so_far,
         buckets,
+        merged_hist_v2,
+        merged_uncorrected_hist_v2,
     }
 }
 

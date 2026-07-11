@@ -50,6 +50,10 @@ pub struct RunRequest {
     /// `http://control:8000/v1/_internal/runs/{run_id}/tick`. If omitted, no
     /// live ticks are pushed (the final summary is still returned).
     pub control_tick_url: Option<String>,
+    /// Where to POST a one-shot finalize body once dispatch ends. Typically
+    /// `http://control:8000/v1/_internal/runs/{run_id}/finalize`. Body shape
+    /// matches the control plane's FinalizeRunRequest.
+    pub control_finalize_url: Option<String>,
 }
 
 fn default_method() -> String { "GET".into() }
@@ -112,6 +116,12 @@ async fn list_workers(State(state): State<AppState>) -> impl IntoResponse {
     Json(views)
 }
 
+#[tracing::instrument(
+    name = "coordinator.run_endpoint",
+    level = "info",
+    skip(state, req),
+    fields(run_id = %req.run_id, target_rps = req.target_rps, duration_s = req.duration_s),
+)]
 async fn run_endpoint(
     State(state): State<AppState>,
     Json(req): Json<RunRequest>,
@@ -132,33 +142,141 @@ async fn run_endpoint(
         content_type: req.content_type,
     };
 
-    // Optional live tick pusher: if a control_tick_url is supplied, drain
-    // aggregated ticks and POST each as JSON.
-    let (tick_tx, push_handle) = match req.control_tick_url.as_ref() {
-        Some(url) => {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AggregatedTick>();
-            let url = url.clone();
-            let handle = tokio::spawn(async move {
+    // Live tick aggregator. Always runs; it tracks running totals so we can
+    // /finalize regardless of whether the caller wanted live push to control.
+    // The closure forwards each tick to `control_tick_url` when set.
+    let (tick_tx, push_handle, finals_handle) = {
+        use tracing::Instrument;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AggregatedTick>();
+        let tick_url = req.control_tick_url.clone();
+        let finals = std::sync::Arc::new(std::sync::Mutex::new(FinalsAcc::default()));
+        let finals_clone = finals.clone();
+        // .in_current_span attaches the run_endpoint span to the spawned task.
+        let handle = tokio::spawn(
+            async move {
                 let http = reqwest::Client::new();
                 while let Some(tick) = rx.recv().await {
-                    let _ = http.post(&url).json(&tick).send().await;
+                    {
+                        let mut f = finals_clone.lock().unwrap();
+                        f.observe(&tick);
+                    }
+                    if let Some(url) = tick_url.as_ref() {
+                        let req = http.post(url).json(&tick);
+                        let _ = req.send().await;
+                    }
                 }
-            });
-            (Some(tx), Some(handle))
-        }
-        None => (None, None),
+            }
+            .in_current_span(),
+        );
+        (Some(tx), Some(handle), finals)
     };
 
     let result = dispatch_with_ticks(state.coord.clone(), spec, tick_tx).await;
     if let Some(h) = push_handle {
         let _ = h.await;
     }
+    let finals_snapshot = finals_handle.lock().unwrap().clone();
     match result {
-        Ok(summary) => Ok(Json(to_response(req.run_id, summary))),
+        Ok(summary) => {
+            // Best-effort finalize push. Body shape matches control's
+            // FinalizeRunRequest. p999 is reported as p99 (we don't carry
+            // p999 in AggregatedTick today; control's column is nullable but
+            // the engine binary sends it, so we set it to p99 to keep the
+            // shape consistent and never zero).
+            if let Some(url) = req.control_finalize_url.as_ref() {
+                use base64::Engine as _;
+                let enc = base64::engine::general_purpose::STANDARD;
+                let hist_b64 = if finals_snapshot.last_hist_v2.is_empty() {
+                    String::new()
+                } else {
+                    enc.encode(&finals_snapshot.last_hist_v2)
+                };
+                let uncorrected_b64 = if finals_snapshot.last_uncorrected_hist_v2.is_empty() {
+                    String::new()
+                } else {
+                    enc.encode(&finals_snapshot.last_uncorrected_hist_v2)
+                };
+                let body = serde_json::json!({
+                    "effective_rps":  finals_snapshot.last_achieved_rps,
+                    "p50_us":  finals_snapshot.last_p50_us as i64,
+                    "p95_us":  finals_snapshot.last_p95_us as i64,
+                    "p99_us":  finals_snapshot.last_p99_us as i64,
+                    "p999_us": finals_snapshot.last_p99_us as i64,
+                    "total_requests": summary.total_completed as i64,
+                    "total_pass":     summary.total_pass as i64,
+                    "cliff_rps": finals_snapshot.cliff_rps(),
+                    "status": "completed",
+                    "corrected_hist_b64": hist_b64,
+                    "uncorrected_hist_b64": uncorrected_b64,
+                });
+                let http = reqwest::Client::new();
+                let req = http.post(url).json(&body);
+                if let Err(e) = req.send().await {
+                    eprintln!("coordinator: finalize push failed: {e}");
+                }
+            }
+            Ok(Json(to_response(req.run_id, summary)))
+        }
         Err(DispatchError::NoWorkers) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody { error: "no registered workers".into() }),
         )),
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+struct FinalsAcc {
+    last_p50_us: u64,
+    last_p95_us: u64,
+    last_p99_us: u64,
+    last_achieved_rps: f64,
+    // Latest non-empty V2-deflate merged HDR snapshot from any tick. Used as
+    // the run-final histogram shipped to control.
+    last_hist_v2: Vec<u8>,
+    last_uncorrected_hist_v2: Vec<u8>,
+    // Per-RPS bucket accumulator keyed by floor(rps_lo). Tracks total+pass for
+    // cliff detection.
+    buckets: std::collections::BTreeMap<u64, (f64, f64, u64, u64)>,
+}
+
+impl FinalsAcc {
+    fn observe(&mut self, tick: &AggregatedTick) {
+        // The HDR-merged percentiles are monotonically informative; take the
+        // latest non-zero values so a final tick with no merge bytes doesn't
+        // clobber the run finals.
+        if tick.percentiles_so_far.p99_us > 0 {
+            self.last_p50_us = tick.percentiles_so_far.p50_us;
+            self.last_p95_us = tick.percentiles_so_far.p95_us;
+            self.last_p99_us = tick.percentiles_so_far.p99_us;
+        }
+        if !tick.merged_hist_v2.is_empty() {
+            self.last_hist_v2 = tick.merged_hist_v2.clone();
+        }
+        if !tick.merged_uncorrected_hist_v2.is_empty() {
+            self.last_uncorrected_hist_v2 = tick.merged_uncorrected_hist_v2.clone();
+        }
+        self.last_achieved_rps = tick.achieved_rps_1s;
+        for b in &tick.buckets {
+            let entry = self.buckets.entry(b.rps_lo as u64).or_default();
+            entry.0 = b.rps_lo;
+            entry.1 = b.rps_hi;
+            entry.2 += b.total;
+            entry.3 += b.pass;
+        }
+    }
+    fn cliff_rps(&self) -> Option<f64> {
+        // Mirrors engine-worker's detector: lowest-RPS bucket with >=30 samples
+        // whose pass rate fell below 0.95.
+        for (_, &(lo, hi, total, pass)) in self.buckets.iter() {
+            if total < 30 {
+                continue;
+            }
+            let pass_rate = pass as f64 / total as f64;
+            if pass_rate < 0.95 {
+                return Some((lo + hi) / 2.0);
+            }
+        }
+        None
     }
 }
 

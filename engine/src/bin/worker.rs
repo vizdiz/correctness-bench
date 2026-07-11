@@ -99,6 +99,15 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    tracing_subscriber::fmt()
+        .json()
+        .with_current_span(true)
+        .with_span_list(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let rt = if cli.worker_threads == 1 {
         tokio::runtime::Builder::new_current_thread()
@@ -153,29 +162,101 @@ fn main() -> anyhow::Result<()> {
             _ => None,
         };
         let want_ticks = cli.ticks || push_url.is_some();
+        // Accumulator for per-bucket pass rate, used by the cliff detector
+        // post-run. Shared between the tick task and the main thread.
+        let bucket_accum: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, BucketCounts>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
         let tick_tx = if want_ticks {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<engine::Tick>();
             let print_json = cli.ticks;
             let http = push_url.as_ref().map(|_| reqwest::Client::new());
             let push_url = push_url.clone();
-            tokio::spawn(async move {
-                while let Some(tick) = rx.recv().await {
-                    if print_json {
-                        if let Ok(line) = serde_json::to_string(&tick) {
-                            println!("{line}");
+            let bucket_accum = bucket_accum.clone();
+            use tracing::Instrument;
+            tokio::spawn(
+                async move {
+                    while let Some(tick) = rx.recv().await {
+                        if print_json {
+                            if let Ok(line) = serde_json::to_string(&tick) {
+                                println!("{line}");
+                            }
+                        }
+                        {
+                            let mut m = bucket_accum.lock().unwrap();
+                            for b in &tick.buckets {
+                                // Key on rps_lo (integer) for the BTreeMap. Each
+                                // tick contributes its 1-second counts.
+                                let key = b.rps_lo as u64;
+                                let entry = m.entry(key).or_default();
+                                entry.rps_lo = b.rps_lo;
+                                entry.rps_hi = b.rps_hi;
+                                entry.total += b.total;
+                                entry.pass += b.pass;
+                            }
+                        }
+                        if let (Some(url), Some(client)) = (&push_url, &http) {
+                            let req = client.post(url).json(&tick);
+                            let _ = req.send().await;
                         }
                     }
-                    if let (Some(url), Some(client)) = (&push_url, &http) {
-                        let _ = client.post(url).json(&tick).send().await;
-                    }
                 }
-            });
+                .in_current_span(),
+            );
             Some(tx)
         } else {
             None
         };
 
         let report = engine::run_with_ticks(spec, tick_tx).await?;
+
+        // Compute cliff_rps from the accumulated bucket stream BEFORE we
+        // drop into the local print block. Definition: lowest-RPS bucket
+        // (by rps_lo) where pass_rate drops below 0.95. None when the run
+        // stays healthy or never reached enough samples per bucket.
+        let cliff_rps = {
+            let m = bucket_accum.lock().unwrap();
+            detect_cliff_rps(&m, 0.95, 30)
+        };
+
+        // Push a one-shot finalize to control so the run row gets its final
+        // percentiles + totals + lifecycle status. Best-effort: a failure here
+        // doesn't fail the binary (the report still prints locally).
+        if let (Some(base), Some(rid)) = (cli.push_to.as_deref(), cli.run_id.as_deref()) {
+            let finalize_url = format!(
+                "{}/v1/_internal/runs/{}/finalize",
+                base.trim_end_matches('/'),
+                rid
+            );
+            // V2-deflate both corrected + uncorrected histograms for the JSON
+            // histogram endpoint and the COO-delta on completed runs.
+            let (corrected_b64, uncorrected_b64) = {
+                use base64::Engine as _;
+                let enc = base64::engine::general_purpose::STANDARD;
+                let c = engine::hist::serialize_v2(&report.histos.corrected);
+                let u = engine::hist::serialize_v2(&report.histos.uncorrected);
+                (enc.encode(&c), enc.encode(&u))
+            };
+            let body = serde_json::json!({
+                "effective_rps":  report.achieved_rps,
+                "p50_us":  report.corrected.p50_us as i64,
+                "p95_us":  report.corrected.p95_us as i64,
+                "p99_us":  report.corrected.p99_us as i64,
+                "p999_us": report.corrected.p999_us as i64,
+                "total_requests": report.completed as i64,
+                "total_pass":     report.pass as i64,
+                "cliff_rps": cliff_rps,
+                "status": "completed",
+                "corrected_hist_b64": corrected_b64,
+                "uncorrected_hist_b64": uncorrected_b64,
+            });
+            let client = reqwest::Client::new();
+            let req = client.post(&finalize_url).json(&body);
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => eprintln!("engine-worker: finalize returned {}", r.status()),
+                Err(e) => eprintln!("engine-worker: finalize failed: {e}"),
+            }
+        }
 
         println!();
         println!(
@@ -252,4 +333,33 @@ fn main() -> anyhow::Result<()> {
 
 fn ms(us: u64) -> String {
     format!("{:.1}", us as f64 / 1000.0)
+}
+
+#[derive(Default, Clone, Debug)]
+struct BucketCounts {
+    rps_lo: f64,
+    rps_hi: f64,
+    total: u64,
+    pass: u64,
+}
+
+/// detect_cliff_rps: the lowest offered-RPS bucket where the cumulative pass
+/// rate drops below `threshold` (typical 0.95), restricted to buckets with at
+/// least `min_samples` requests so a single bad tick doesn't trigger a phantom
+/// cliff. Returns the bucket midpoint, or None if no bucket fails.
+fn detect_cliff_rps(
+    buckets: &std::collections::BTreeMap<u64, BucketCounts>,
+    threshold: f64,
+    min_samples: u64,
+) -> Option<f64> {
+    for (_, b) in buckets.iter() {
+        if b.total < min_samples {
+            continue;
+        }
+        let pass_rate = b.pass as f64 / b.total as f64;
+        if pass_rate < threshold {
+            return Some((b.rps_lo + b.rps_hi) / 2.0);
+        }
+    }
+    None
 }

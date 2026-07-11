@@ -5,11 +5,36 @@
 //! keeps memory modest. Histograms are mergeable and V2-serializable for
 //! later transport to the coordinator (gate #3) and storage.
 
+use hdrhistogram::serialization::{Deserializer, Serializer, V2DeflateSerializer};
 use hdrhistogram::Histogram;
 
-const MIN_US: u64 = 1;
-const MAX_US: u64 = 60_000_000;
-const SIG_FIGS: u8 = 3;
+pub const MIN_US: u64 = 1;
+pub const MAX_US: u64 = 60_000_000;
+pub const SIG_FIGS: u8 = 3;
+
+/// Build a fresh empty Histogram with the same bounds the engine uses, so
+/// the coordinator can deserialize per-worker snapshots into it and merge.
+pub fn new_corrected_target() -> Histogram<u64> {
+    Histogram::new_with_bounds(MIN_US, MAX_US, SIG_FIGS).unwrap()
+}
+
+/// V2-deflate serialize a histogram into bytes for the wire.
+pub fn serialize_v2(h: &Histogram<u64>) -> Vec<u8> {
+    let mut s = V2DeflateSerializer::new();
+    let mut bytes = Vec::new();
+    let _ = s.serialize(h, &mut bytes);
+    bytes
+}
+
+/// Inverse of `serialize_v2`. Returns None on a malformed or empty payload.
+pub fn deserialize_v2(bytes: &[u8]) -> Option<Histogram<u64>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut d = Deserializer::new();
+    let mut cur = std::io::Cursor::new(bytes);
+    d.deserialize(&mut cur).ok()
+}
 
 /// One worker's per-stream pair: latency from the *intended* send time
 /// (corrected) plus latency from the actual send time (uncorrected). Their
