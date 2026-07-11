@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,6 +28,31 @@ use tokio::time::{timeout, Instant};
     about = "Thin client of the correctness-bench control plane"
 )]
 struct Cli {
+    /// Control plane base URL. Available to every subcommand.
+    #[arg(long, env = "BENCH_CONTROL_URL", default_value = "http://localhost:8000",
+          global = true)]
+    control: String,
+
+    /// Web UI base URL. Available to every subcommand.
+    #[arg(long, env = "BENCH_WEB_URL", default_value = "http://localhost:5173",
+          global = true)]
+    web: String,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Create a run, stream its ticks, and print the final summary.
+    /// (Default subcommand for the historical flat-flag invocation.)
+    Run(RunArgs),
+    /// Compare a candidate run against a baseline; exit 0 on pass, 1 on regression.
+    Regression(RegressionArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
     /// Target URL to benchmark. Sent as `target.url`.
     #[arg(short = 't', long)]
     target: String,
@@ -69,17 +94,28 @@ struct Cli {
     #[arg(long, env = "BENCH_API_KEY", hide_env_values = true)]
     key: Option<String>,
 
-    /// Control plane base URL.
-    #[arg(long, env = "BENCH_CONTROL_URL", default_value = "http://localhost:8000")]
-    control: String,
-
-    /// Web UI base URL for the dashboard link printed on start.
-    #[arg(long, env = "BENCH_WEB_URL", default_value = "http://localhost:5173")]
-    web: String,
-
     /// Per-request timeout (ms).
     #[arg(long, default_value_t = 30_000)]
     timeout_ms: u64,
+}
+
+#[derive(clap::Args, Debug)]
+struct RegressionArgs {
+    /// Candidate run UUID. Must already be finalized in control.
+    candidate: String,
+
+    /// Baseline run UUID to compare against. Must already be finalized.
+    #[arg(long)]
+    baseline: String,
+
+    /// Maximum allowed p99 latency regression in percent. Exceeding fails.
+    #[arg(long, default_value_t = 10.0)]
+    p99_delta_pct: f64,
+
+    /// Maximum allowed correctness drop in absolute percent points. Exceeding
+    /// fails (a drop is measured as candidate.pass_rate < baseline.pass_rate).
+    #[arg(long, default_value_t = 1.0)]
+    correctness_delta_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -173,9 +209,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match rt.block_on(run(cli)) {
+    let result = rt.block_on(async {
+        match &cli.cmd {
+            Cmd::Run(_) => run(&cli).await,
+            Cmd::Regression(_) => regression(&cli).await,
+        }
+    });
+    match result {
         Ok(ExitKind::Completed) => ExitCode::SUCCESS,
-        Ok(ExitKind::Aborted) | Ok(ExitKind::EngineError) => ExitCode::from(1),
+        Ok(ExitKind::Aborted) | Ok(ExitKind::EngineError) | Ok(ExitKind::Regressed) => ExitCode::from(1),
         Err(BenchError::Unreachable(msg)) | Err(BenchError::BadSpec(msg)) => {
             eprintln!("bench: {msg}");
             ExitCode::from(2)
@@ -191,6 +233,7 @@ enum ExitKind {
     Completed,
     Aborted,
     EngineError,
+    Regressed,
 }
 
 #[derive(Debug)]
@@ -206,19 +249,23 @@ impl From<anyhow::Error> for BenchError {
     }
 }
 
-async fn run(cli: Cli) -> Result<ExitKind, BenchError> {
+async fn run(cli: &Cli) -> Result<ExitKind, BenchError> {
+    let args = match &cli.cmd {
+        Cmd::Run(a) => a,
+        _ => unreachable!("run() dispatched without Cmd::Run"),
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| BenchError::Internal(anyhow!("build http client: {e}")))?;
 
-    let create = build_create_request(&cli);
+    let create = build_create_request(args);
     let run_id = post_run(&client, &cli.control, &create).await?;
 
     println!(
         "bench: created run {run_id}\n       dashboard: {web}/runs/{run_id}\n       streaming live ticks ({d}s)...",
         web = cli.web.trim_end_matches('/'),
-        d = cli.duration_s,
+        d = args.duration_s,
     );
 
     let stream_url = format!("{}/v1/runs/{}/stream", cli.control.trim_end_matches('/'), run_id);
@@ -227,7 +274,7 @@ async fn run(cli: Cli) -> Result<ExitKind, BenchError> {
     let accum_cell = std::sync::Arc::new(std::sync::Mutex::new(accum));
 
     // Grace beyond duration_s for the last tick + body drains.
-    let total_wait = Duration::from_secs(cli.duration_s + 5);
+    let total_wait = Duration::from_secs(args.duration_s + 5);
     let watcher = stream_ticks(client.clone(), &stream_url, accum_cell.clone());
 
     tokio::select! {
@@ -255,44 +302,122 @@ async fn run(cli: Cli) -> Result<ExitKind, BenchError> {
     if final_accum.received == 0 {
         eprintln!(
             "bench: no ticks received in {}s — is an engine worker firing this run? \n       (start one with: --push-to {} --run-id {})",
-            cli.duration_s + 5,
+            args.duration_s + 5,
             cli.control.trim_end_matches('/'),
             run_id,
         );
         return Ok(ExitKind::EngineError);
     }
-    print_summary(&cli, &run_id, &final_accum);
+    print_summary(cli, args, &run_id, &final_accum);
     Ok(ExitKind::Completed)
 }
 
-fn build_create_request(cli: &Cli) -> CreateRunRequest {
+async fn regression(cli: &Cli) -> Result<ExitKind, BenchError> {
+    let args = match &cli.cmd {
+        Cmd::Regression(a) => a,
+        _ => unreachable!("regression() dispatched without Cmd::Regression"),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| BenchError::Internal(anyhow!("build http client: {e}")))?;
+
+    let url = format!(
+        "{}/v1/runs/{}/regression-check",
+        cli.control.trim_end_matches('/'),
+        args.candidate
+    );
+    let body = json!({
+        "baseline_run_id": args.baseline,
+        "thresholds": {
+            "p99_delta_pct": args.p99_delta_pct,
+            "correctness_delta_pct": args.correctness_delta_pct,
+        }
+    });
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(BenchError::Unreachable(format!(
+                "control plane at {} unreachable: {e}",
+                cli.control
+            )));
+        }
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(BenchError::BadSpec(format!(
+            "POST {url} -> {status}: {text}"
+        )));
+    }
+    let parsed: RegressionResponse = serde_json::from_str(&text)
+        .with_context(|| format!("decode RegressionResponse: {text}"))
+        .map_err(BenchError::Internal)?;
+
+    println!();
+    println!("  candidate      {}", args.candidate);
+    println!("  baseline       {}", args.baseline);
+    println!(
+        "  thresholds     p99={:.1}%  correctness={:.1}%",
+        args.p99_delta_pct, args.correctness_delta_pct
+    );
+    println!();
+    println!(
+        "  p99 delta      {:+.2}%   (baseline -> candidate)",
+        parsed.p99_delta_pct
+    );
+    println!(
+        "  correctness    {:+.2} pp",
+        parsed.correctness_delta_pct
+    );
+    println!("  cliff RPS      {:+.2}", parsed.cliff_rps_delta);
+    println!();
+    if parsed.passed {
+        println!("  PASS — {}", parsed.details);
+        Ok(ExitKind::Completed)
+    } else {
+        println!("  FAIL — {}", parsed.details);
+        Ok(ExitKind::Regressed)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct RegressionResponse {
+    passed: bool,
+    p99_delta_pct: f64,
+    correctness_delta_pct: f64,
+    cliff_rps_delta: f64,
+    details: String,
+}
+
+fn build_create_request(args: &RunArgs) -> CreateRunRequest {
     let mut headers = serde_json::Map::new();
-    if let Some(key) = cli.key.as_ref() {
+    if let Some(key) = args.key.as_ref() {
         headers.insert(
             "Authorization".into(),
             serde_json::Value::String(format!("Bearer {key}")),
         );
     }
     let mut assert = serde_json::Map::new();
-    if !cli.expected_status.is_empty() {
-        assert.insert("expected_status".into(), json!(cli.expected_status));
+    if !args.expected_status.is_empty() {
+        assert.insert("expected_status".into(), json!(args.expected_status));
     }
-    if let Some(ms) = cli.max_latency_ms {
+    if let Some(ms) = args.max_latency_ms {
         assert.insert("max_latency_us".into(), json!(ms * 1000));
     }
     CreateRunRequest {
-        name: cli.name.clone(),
+        name: args.name.clone(),
         target: TargetSpec {
-            url: cli.target.clone(),
-            method: cli.method.to_ascii_uppercase(),
+            url: args.target.clone(),
+            method: args.method.to_ascii_uppercase(),
             headers,
-            timeout_ms: cli.timeout_ms,
+            timeout_ms: args.timeout_ms,
             verify_tls: true,
         },
-        target_rps: cli.rps,
-        duration_s: cli.duration_s,
-        load_model: cli.load_model.clone(),
-        connections: cli.connections,
+        target_rps: args.rps,
+        duration_s: args.duration_s,
+        load_model: args.load_model.clone(),
+        connections: args.connections,
         keepalive: true,
         assert: serde_json::Value::Object(assert),
         rate_limit_policy: json!({ "action": "backoff", "record_onset": true }),
@@ -438,7 +563,7 @@ fn handle_event(
     a.received += 1;
 }
 
-fn print_summary(cli: &Cli, run_id: &str, accum: &TickAccum) {
+fn print_summary(cli: &Cli, args: &RunArgs, run_id: &str, accum: &TickAccum) {
     let last = match &accum.last {
         Some(t) => t,
         None => return,
@@ -452,10 +577,10 @@ fn print_summary(cli: &Cli, run_id: &str, accum: &TickAccum) {
     let p99_ms = last.percentiles_so_far.p99_us as f64 / 1000.0;
     println!();
     println!("  run            {run_id}");
-    if let Some(name) = cli.name.as_ref() {
+    if let Some(name) = args.name.as_ref() {
         println!("  name           {name}");
     }
-    println!("  target         {} {}", cli.method.to_ascii_uppercase(), cli.target);
+    println!("  target         {} {}", args.method.to_ascii_uppercase(), args.target);
     println!("  ticks received {}", accum.received);
     println!("  requests       {}", last.completed_total);
     println!(

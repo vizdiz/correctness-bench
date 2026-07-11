@@ -1,0 +1,139 @@
+# Per-package CI. Each job is a hermetic build + test for one part of the
+# monorepo so a failure points at the right package without forcing the others
+# to rebuild. The web visual-regression job is the only one that needs a
+# browser; everything else is plain Rust / Go / TS.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel an in-flight CI run for a branch when a new push happens.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: engine (rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'engine -> target'
+      # protoc is needed by tonic-build for bench.proto.
+      - name: install protoc
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y protobuf-compiler
+      - name: build
+        run: cargo build --locked --all-targets
+        working-directory: engine
+      - name: test
+        run: cargo test --locked --all-targets
+        working-directory: engine
+        env:
+          RUST_BACKTRACE: 1
+
+  control:
+    name: control (go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: control/go.mod
+          cache-dependency-path: control/go.sum
+      - name: build
+        run: go build ./...
+        working-directory: control
+      - name: test
+        run: go test -race -count=1 ./...
+        working-directory: control
+
+  cli:
+    name: cli (rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'cli -> target'
+      - name: build
+        run: cargo build --locked --release
+        working-directory: cli
+
+  mock:
+    name: mock (rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'mock -> target'
+      - name: build
+        run: cargo build --locked --all-targets
+        working-directory: mock
+      - name: test
+        run: cargo test --locked --all-targets
+        working-directory: mock
+
+  mcp:
+    name: mcp (typescript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+      - name: install
+        run: npm ci
+        working-directory: mcp
+      - name: typecheck
+        run: npx tsc --noEmit
+        working-directory: mcp
+
+  web:
+    name: web (build + visual regression)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install
+        run: npm ci
+        working-directory: web
+      - name: production build
+        run: npm run build
+        working-directory: web
+      # Visual regression: hermetic (page.route fixtures), so no docker / db.
+      - name: install playwright browser
+        run: npx playwright install --with-deps chromium
+        working-directory: web
+      - name: visual regression
+        run: npm run test:visual
+        working-directory: web
+      - name: upload visual diff on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/test-results
+          if-no-files-found: ignore

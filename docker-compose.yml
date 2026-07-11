@@ -53,6 +53,9 @@ services:
       # libpq-style DSN consumed by pgx.
       DATABASE_URL: "postgres://bench:bench@postgres:5432/bench?sslmode=disable"
       CONTROL_ADDR: ":8000"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_SERVICE_NAME: "control"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=local"
     ports:
       - "8000:8000"
     healthcheck:
@@ -95,6 +98,10 @@ services:
     image: correctness-bench-engine
     entrypoint: ["/usr/local/bin/coordinator"]
     command: ["--grpc-addr", "0.0.0.0:9090", "--admin-addr", "0.0.0.0:9091"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_SERVICE_NAME: "coordinator"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=local"
     ports:
       - "9091:9091"   # admin HTTP only; gRPC is internal to the bench network
     healthcheck:
@@ -112,6 +119,10 @@ services:
       "--coord", "http://coordinator:9090",
       "--listen", "0.0.0.0:9092",
     ]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_SERVICE_NAME: "worker_node"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=local"
     # WORKER_ADDRESS is derived from $HOSTNAME by the binary (compose gives
     # each replica a unique DNS-resolvable name on the bench network), so
     # peers reach us via correctness-bench-worker_node-1:9092, etc.
@@ -122,8 +133,92 @@ services:
       replicas: 2   # docker compose up --scale worker_node=N to vary
     networks: [bench]
 
+  # ---- OBSERVABILITY: traces (Jaeger) + logs (Loki) + UI (Grafana) ----
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./ops/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP/gRPC
+      - "4318:4318"   # OTLP/HTTP
+      - "13133:13133" # health
+    depends_on:
+      jaeger:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks: [bench]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.64.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # Jaeger UI
+      # 4317 is owned by otel-collector; Jaeger receives OTLP from it internally.
+    networks: [bench]
+
+  loki:
+    image: grafana/loki:3.5
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./ops/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - lokidata:/loki
+    ports:
+      - "3100:3100"
+    networks: [bench]
+
+  promtail:
+    image: grafana/promtail:3.5
+    command: ["-config.file=/etc/promtail/promtail-config.yaml"]
+    volumes:
+      - ./ops/promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      loki:
+        condition: service_started
+    networks: [bench]
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks: [bench]
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      loki:
+        condition: service_started
+      jaeger:
+        condition: service_started
+    networks: [bench]
+
 volumes:
   pgdata:
+  lokidata:
+  grafanadata:
+  promdata:
 
 networks:
   bench:

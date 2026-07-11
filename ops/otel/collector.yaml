@@ -1,0 +1,62 @@
+# OpenTelemetry collector: terminate OTLP from every app service, fan out to
+# Jaeger (traces) and Loki (logs). Health endpoint on 13133.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: 256
+
+exporters:
+  # Jaeger via OTLP (Jaeger 1.50+ accepts OTLP natively).
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Loki for structured logs.
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+
+  # Metrics are scraped from this Prometheus exporter by the Prometheus
+  # service in docker-compose. Resource attributes (service.name, etc) are
+  # promoted to labels so series can be filtered per service.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Promote service.name and other resource attributes into labels so series
+    # can be split per service in Grafana.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/jaeger]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [loki]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
