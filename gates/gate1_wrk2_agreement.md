@@ -17,3 +17,17 @@ Different runtimes (C epoll vs Tokio) won't be bit-identical. >5% drift means a 
 
 ## This gate exists because
 Coordinated omission is the one thing wrk2 got right that everyone else gets wrong. If our numbers match wrk2's, the COO port is correct. This is THE checkpoint.
+
+## Differential matrix sweep
+`gates/wrk2_sweep.sh` extends the single-point gate to a small matrix
+(RPS in {200, 500, 1000} by default; override with `RUNS=`). For each
+(RPS, percentile in {p50, p95, p99}) pair the script asserts engine and wrk2
+agree within ±5% (override with `TOLERANCE_PCT=`).
+
+Prereqs:
+- `cargo` on PATH (the script builds engine + mock in release mode).
+- wrk2 binary at `tools/wrk2/wrk` or via `WRK2_BIN=/path/to/wrk`. Build with
+  `docker build -t wrk2-local tools/wrk2/` then copy `/wrk2/wrk` out.
+
+Run: `gates/wrk2_sweep.sh`. Exits 0 on full agreement, 1 on any drift, 2 on a
+setup error (missing wrk2 binary, cargo missing, etc.).

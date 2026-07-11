@@ -1,0 +1,66 @@
+{
+  "gate": 3,
+  "name": "fleet merge correctness",
+  "verdict": "PASS",
+  "generated_at": "2026-07-11T01:42:26Z",
+  "params": {
+    "target_rps": 2000.0,
+    "duration_s": 60,
+    "workers_run_b": 2,
+    "connections": 50,
+    "base_latency_ms": 10
+  },
+  "tolerances_pct": {
+    "latency": 5.0,
+    "count": 2.0,
+    "rate": 10.0
+  },
+  "full": {
+    "p50_us": 11863,
+    "p95_us": 12847,
+    "p99_us": 13311,
+    "total_requests": 119979,
+    "total_pass": 119979,
+    "effective_rps": 1998.0
+  },
+  "half_plus_half": {
+    "p50_us": 11735,
+    "p95_us": 12439,
+    "p99_us": 13319,
+    "total_requests": 119979,
+    "total_pass": 119979,
+    "effective_rps": 2001.0
+  },
+  "checks": [
+    {
+      "metric": "p50_us",
+      "delta_pct": 1.079,
+      "tol_pct": 5.0,
+      "pass": true
+    },
+    {
+      "metric": "p95_us",
+      "delta_pct": 3.176,
+      "tol_pct": 5.0,
+      "pass": true
+    },
+    {
+      "metric": "p99_us",
+      "delta_pct": 0.06,
+      "tol_pct": 5.0,
+      "pass": true
+    },
+    {
+      "metric": "total_requests",
+      "delta_pct": 0.0,
+      "tol_pct": 2.0,
+      "pass": true
+    },
+    {
+      "metric": "effective_rps_vs_target",
+      "delta_pct": 0.05,
+      "tol_pct": 10.0,
+      "pass": true
+    }
+  ]
+}

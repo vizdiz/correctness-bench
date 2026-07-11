@@ -1,0 +1,45 @@
+{
+  "gate": 2,
+  "name": "oracle (injected failure rate)",
+  "verdict": "PASS",
+  "generated_at": "2026-07-11T01:43:17Z",
+  "params": {
+    "inject_pct": 100.0,
+    "tolerance_pp": 5.0
+  },
+  "modes": [
+    {
+      "mode": "fast500",
+      "metric": "fail_status",
+      "reported_pct": 97.94,
+      "band_pct": [
+        85.0,
+        100.0
+      ],
+      "tol_pp": 5.0,
+      "verdict": "PASS"
+    },
+    {
+      "mode": "slow_ok",
+      "metric": "fail_latency",
+      "reported_pct": 100.0,
+      "band_pct": [
+        85.0,
+        100.0
+      ],
+      "tol_pp": 5.0,
+      "verdict": "PASS"
+    },
+    {
+      "mode": "truncate",
+      "metric": "fail_size",
+      "reported_pct": 100.0,
+      "band_pct": [
+        85.0,
+        100.0
+      ],
+      "tol_pp": 5.0,
+      "verdict": "PASS"
+    }
+  ]
+}
