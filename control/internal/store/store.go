@@ -24,7 +24,11 @@ type Store struct {
 }
 
 func New(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +74,16 @@ type RunRow struct {
 	CreatedAt    time.Time
 	StartedAt    *time.Time
 	CompletedAt  *time.Time
+	// Finals - populated once FinalizeRun runs. Nil while the run is in flight
+	// or never finalized.
+	P50US           *int64
+	P95US           *int64
+	P99US           *int64
+	P999US          *int64
+	TotalRequests   *int64
+	TotalPass       *int64
+	CliffRPS        *float64
+	CostPerReqUSD   *float64
 }
 
 // InsertRun inserts a queued run and returns its id + created_at.
@@ -101,12 +115,16 @@ RETURNING id, created_at`
 func (s *Store) GetRun(ctx context.Context, id string) (*RunRow, error) {
 	const q = `
 SELECT id, name, status, target_url, target_method, target_rps, duration_s,
-       effective_rps, created_at, started_at, completed_at
+       effective_rps, created_at, started_at, completed_at,
+       p50_us, p95_us, p99_us, p999_us,
+       total_requests, total_pass, cliff_rps, cost_per_request_usd
 FROM runs WHERE id = $1`
 	var r RunRow
 	err := s.pool.QueryRow(ctx, q, id).Scan(
 		&r.ID, &r.Name, &r.Status, &r.TargetURL, &r.TargetMethod, &r.TargetRPS, &r.DurationS,
 		&r.EffectiveRPS, &r.CreatedAt, &r.StartedAt, &r.CompletedAt,
+		&r.P50US, &r.P95US, &r.P99US, &r.P999US,
+		&r.TotalRequests, &r.TotalPass, &r.CliffRPS, &r.CostPerReqUSD,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -217,6 +235,90 @@ func (s *Store) AbortRun(ctx context.Context, id string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return abortedAt, nil
+}
+
+// FinalizeRunParams is what the engine pushes when its run loop ends. All
+// percentile fields are microseconds (corrected). Counts are run totals.
+type FinalizeRunParams struct {
+	EffectiveRPS  float64
+	P50US         int64
+	P95US         int64
+	P99US         int64
+	P999US        int64
+	TotalRequests int64
+	TotalPass     int64
+	CliffRPS      *float64
+	Status        string // "completed" | "failed" | "aborted" - caller decides
+	StatusReason  string // optional, persisted into runs.status_reason
+	// CorrectedHistBytes is the V2-deflate HDR snapshot persisted to
+	// runs.final_corrected_hist (BYTEA). nil leaves the column untouched.
+	CorrectedHistBytes []byte
+	// UncorrectedHistBytes is the V2-deflate HDR snapshot persisted to
+	// runs.final_uncorrected_hist; same COALESCE semantics as corrected.
+	UncorrectedHistBytes []byte
+}
+
+// FinalizeRun writes the run's finals + transitions to `Status`. Idempotent in
+// the sense that a second call overwrites the fields; lifecycle invariants
+// (terminal -> terminal) are NOT enforced here — caller should send finalize
+// at most once per run.
+func (s *Store) FinalizeRun(ctx context.Context, id string, p FinalizeRunParams) error {
+	// COALESCE on the histogram columns so callers that omit them (nil)
+	// don't wipe previously-persisted snapshots.
+	const q = `
+UPDATE runs
+SET effective_rps = $2,
+    p50_us = $3, p95_us = $4, p99_us = $5, p999_us = $6,
+    total_requests = $7, total_pass = $8,
+    cliff_rps = $9,
+    status = $10, status_reason = NULLIF($11, ''),
+    final_corrected_hist = COALESCE($12, final_corrected_hist),
+    final_uncorrected_hist = COALESCE($13, final_uncorrected_hist),
+    completed_at = COALESCE(completed_at, now())
+WHERE id = $1`
+	tag, err := s.pool.Exec(ctx, q, id,
+		p.EffectiveRPS, p.P50US, p.P95US, p.P99US, p.P999US,
+		p.TotalRequests, p.TotalPass, p.CliffRPS, p.Status, p.StatusReason,
+		p.CorrectedHistBytes, p.UncorrectedHistBytes,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetFinalHistogram returns the persisted V2-deflate corrected histogram for
+// a run, or (nil, ErrNotFound) when the run row is missing. (nil, nil) when
+// the row exists but no histogram has been pushed yet.
+func (s *Store) GetFinalHistogram(ctx context.Context, id string) ([]byte, error) {
+	const q = `SELECT final_corrected_hist FROM runs WHERE id = $1`
+	var bytes []byte
+	err := s.pool.QueryRow(ctx, q, id).Scan(&bytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return bytes, nil
+}
+
+// GetFinalUncorrectedHistogram is the uncorrected sibling of GetFinalHistogram.
+// (corrected - uncorrected) gives the COO error magnitude on completed runs.
+func (s *Store) GetFinalUncorrectedHistogram(ctx context.Context, id string) ([]byte, error) {
+	const q = `SELECT final_uncorrected_hist FROM runs WHERE id = $1`
+	var bytes []byte
+	err := s.pool.QueryRow(ctx, q, id).Scan(&bytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return bytes, nil
 }
 
 // ---- cursor encoding: opaque base64 of "RFC3339Nano|uuid" ----

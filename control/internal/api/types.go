@@ -43,20 +43,52 @@ type RunTargetView struct {
 	Method string `json:"method"`
 }
 
+// OffloadCountsView is the per-verdict roll-up exposed alongside inline
+// fail-by-tier counts. Omitted entirely when no offload tier was configured
+// for the run (i.e., all four are zero and no rows exist).
+type OffloadCountsView struct {
+	Pass       int64 `json:"pass"`
+	FailSchema int64 `json:"fail_schema"`
+	FailValue  int64 `json:"fail_value"`
+	FailRegex  int64 `json:"fail_regex"`
+}
+
+// PercentilesView is the corrected-latency final percentiles. All zero when
+// the run hasn't been finalized.
+type PercentilesView struct {
+	P50US  int64 `json:"p50_us"`
+	P95US  int64 `json:"p95_us"`
+	P99US  int64 `json:"p99_us"`
+	P999US int64 `json:"p999_us,omitempty"`
+}
+
+// FinalsView holds the per-run final aggregates surfaced once the engine
+// reports a `finalize`. Nil on running / queued / failed-without-finalize.
+type FinalsView struct {
+	Corrected      PercentilesView `json:"corrected"`
+	TotalRequests  int64           `json:"total_requests"`
+	TotalPass      int64           `json:"total_pass"`
+	CorrectnessPct float64         `json:"correctness_pct"`
+	CliffRPS       *float64        `json:"cliff_rps,omitempty"`
+}
+
 // RunView is GET /v1/runs/:id. Fields that don't apply to the current status are
 // omitted. There is deliberately no Headers field anywhere in this type.
 type RunView struct {
-	RunID        string        `json:"run_id"`
-	Name         string        `json:"name,omitempty"`
-	Status       string        `json:"status"`
-	Target       RunTargetView `json:"target"`
-	TargetRPS    float64       `json:"target_rps"`
-	DurationS    int           `json:"duration_s,omitempty"`
-	EffectiveRPS *float64      `json:"effective_rps,omitempty"`
-	CreatedAt    string        `json:"created_at,omitempty"`
-	StartedAt    *string       `json:"started_at,omitempty"`
-	CompletedAt  *string       `json:"completed_at,omitempty"`
-	ElapsedS     *int          `json:"elapsed_s,omitempty"`
+	RunID        string             `json:"run_id"`
+	Name         string             `json:"name,omitempty"`
+	Status       string             `json:"status"`
+	Target       RunTargetView      `json:"target"`
+	TargetRPS    float64            `json:"target_rps"`
+	DurationS    int                `json:"duration_s,omitempty"`
+	EffectiveRPS *float64           `json:"effective_rps,omitempty"`
+	CreatedAt    string             `json:"created_at,omitempty"`
+	StartedAt    *string            `json:"started_at,omitempty"`
+	CompletedAt  *string            `json:"completed_at,omitempty"`
+	ElapsedS     *int               `json:"elapsed_s,omitempty"`
+	Offload           *OffloadCountsView `json:"offload,omitempty"`
+	Final             *FinalsView        `json:"final,omitempty"`
+	CostPerRequestUSD *float64           `json:"cost_per_request_usd,omitempty"`
 }
 
 // RunSummary is a compact list-row.

@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -88,6 +90,104 @@ func (s *Server) evalOneSample(runID string, sample sse.SampledResponse) {
 
 // suppress unused-import warning if all callers go away in the future.
 var _ = offload.VerdictPass
+
+// FinalizeRunRequest is the body of POST /v1/_internal/runs/:id/finalize.
+// Engine workers push this once after their run loop exits to fill in the
+// run's final percentiles, totals, and lifecycle status. All percentile fields
+// are microseconds (corrected).
+type FinalizeRunRequest struct {
+	EffectiveRPS  float64  `json:"effective_rps"`
+	P50US         int64    `json:"p50_us"`
+	P95US         int64    `json:"p95_us"`
+	P99US         int64    `json:"p99_us"`
+	P999US        int64    `json:"p999_us"`
+	TotalRequests int64    `json:"total_requests"`
+	TotalPass     int64    `json:"total_pass"`
+	CliffRPS      *float64 `json:"cliff_rps,omitempty"`
+	Status        string   `json:"status,omitempty"`        // default "completed"
+	StatusReason  string   `json:"status_reason,omitempty"` // optional
+	// Base64-encoded V2-deflate corrected HDR histogram. Persisted to
+	// runs.final_corrected_hist and served verbatim by GET /v1/runs/:id/histogram.
+	CorrectedHistB64 string `json:"corrected_hist_b64,omitempty"`
+	// Base64-encoded V2-deflate uncorrected HDR histogram. Persisted to
+	// runs.final_uncorrected_hist; (corrected - uncorrected) is the COO delta.
+	UncorrectedHistB64 string `json:"uncorrected_hist_b64,omitempty"`
+}
+
+// FinalizeRun: POST /v1/_internal/runs/{id}/finalize. Internal-only endpoint
+// the engine (worker binary or coordinator) calls after its run loop ends.
+// Writes finals + transitions status, idempotent on retry.
+func (s *Server) FinalizeRun(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")
+		return
+	}
+	var req FinalizeRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidRunSpec, "finalize payload not valid JSON", "")
+		return
+	}
+	status := req.Status
+	if status == "" {
+		status = "completed"
+	}
+	switch status {
+	case "completed", "failed", "aborted":
+	default:
+		writeError(w, http.StatusBadRequest, CodeInvalidRunSpec, "status must be completed|failed|aborted", "status")
+		return
+	}
+	var histBytes []byte
+	if req.CorrectedHistB64 != "" {
+		decoded, err := base64.StdEncoding.DecodeString(req.CorrectedHistB64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, CodeInvalidRunSpec,
+				"corrected_hist_b64 is not valid base64", "corrected_hist_b64")
+			return
+		}
+		histBytes = decoded
+	}
+	var uncorrectedBytes []byte
+	if req.UncorrectedHistB64 != "" {
+		decoded, err := base64.StdEncoding.DecodeString(req.UncorrectedHistB64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, CodeInvalidRunSpec,
+				"uncorrected_hist_b64 is not valid base64", "uncorrected_hist_b64")
+			return
+		}
+		uncorrectedBytes = decoded
+	}
+	if err := s.Store.FinalizeRun(r.Context(), id, store.FinalizeRunParams{
+		EffectiveRPS:         req.EffectiveRPS,
+		P50US:                req.P50US,
+		P95US:                req.P95US,
+		P99US:                req.P99US,
+		P999US:               req.P999US,
+		TotalRequests:        req.TotalRequests,
+		TotalPass:            req.TotalPass,
+		CliffRPS:             req.CliffRPS,
+		Status:               status,
+		StatusReason:         req.StatusReason,
+		CorrectedHistBytes:   histBytes,
+		UncorrectedHistBytes: uncorrectedBytes,
+	}); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")
+			return
+		}
+		s.internal(w, "finalize run", err)
+		return
+	}
+	s.Log.Info("run finalized",
+		"run_id", id, "status", status,
+		"effective_rps", req.EffectiveRPS,
+		"p99_us", req.P99US,
+		"total_requests", req.TotalRequests,
+		"total_pass", req.TotalPass,
+	)
+	w.WriteHeader(http.StatusNoContent)
+}
 
 // StreamRun is the api.md SSE endpoint:
 //   GET /v1/runs/{id}/stream

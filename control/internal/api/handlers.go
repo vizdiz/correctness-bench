@@ -135,7 +135,22 @@ func (s *Server) GetRun(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "get run", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, runViewFrom(row))
+	view := runViewFrom(row)
+	// Attach offload verdict counts when at least one row exists. Skipped for
+	// runs without an offload tier so the API surface stays clean.
+	if counts, err := s.Store.OffloadCountsForRun(r.Context(), id); err == nil {
+		if counts.Pass+counts.FailSchema+counts.FailValue+counts.FailRegex > 0 {
+			view.Offload = &OffloadCountsView{
+				Pass:       counts.Pass,
+				FailSchema: counts.FailSchema,
+				FailValue:  counts.FailValue,
+				FailRegex:  counts.FailRegex,
+			}
+		}
+	} else {
+		s.Log.Warn("offload counts read", "run_id", id, "err", err.Error())
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // ListRuns: GET /v1/runs?status=&limit=&cursor= — cursor-based pagination.
@@ -202,6 +217,56 @@ func (s *Server) AbortRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetHistogram: GET /v1/runs/:id/histogram - api.md:148.
+// ?format=json returns a binned JSON the web can render directly. Without
+// format=json, returns the raw V2-deflate bytes with Content-Type
+// application/hdr-v2+gzip so HDR-aware tooling can merge / re-percentile.
+// ?which=uncorrected swaps to the uncorrected snapshot (defaults to corrected).
+func (s *Server) GetHistogram(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("format") == "json" {
+		s.GetHistogramJSON(w, r)
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")
+		return
+	}
+	which := r.URL.Query().Get("which")
+	if which == "" {
+		which = "corrected"
+	}
+	var bytes []byte
+	var err error
+	switch which {
+	case "corrected":
+		bytes, err = s.Store.GetFinalHistogram(r.Context(), id)
+	case "uncorrected":
+		bytes, err = s.Store.GetFinalUncorrectedHistogram(r.Context(), id)
+	default:
+		writeError(w, http.StatusBadRequest, CodeInvalidRunSpec,
+			"which must be corrected or uncorrected", "which")
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")
+		return
+	}
+	if err != nil {
+		s.internal(w, "get histogram", err)
+		return
+	}
+	if len(bytes) == 0 {
+		writeError(w, http.StatusConflict, CodeConflict,
+			"histogram not yet finalized for this run", "")
+		return
+	}
+	w.Header().Set("Content-Type", "application/hdr-v2+gzip")
+	w.Header().Set("Content-Length", strconv.Itoa(len(bytes)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(bytes)
+}
+
 // Health: GET /healthz — checks DB connectivity.
 func (s *Server) Health(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.Ping(r.Context()); err != nil {
@@ -220,14 +285,15 @@ func (s *Server) internal(w http.ResponseWriter, what string, err error) {
 
 func runViewFrom(row *store.RunRow) RunView {
 	v := RunView{
-		RunID:        row.ID,
-		Name:         derefStr(row.Name),
-		Status:       row.Status,
-		Target:       RunTargetView{URL: row.TargetURL, Method: row.TargetMethod},
-		TargetRPS:    row.TargetRPS,
-		DurationS:    row.DurationS,
-		EffectiveRPS: row.EffectiveRPS,
-		CreatedAt:    row.CreatedAt.UTC().Format(time.RFC3339),
+		RunID:             row.ID,
+		Name:              derefStr(row.Name),
+		Status:            row.Status,
+		Target:            RunTargetView{URL: row.TargetURL, Method: row.TargetMethod},
+		TargetRPS:         row.TargetRPS,
+		DurationS:         row.DurationS,
+		EffectiveRPS:      row.EffectiveRPS,
+		CreatedAt:         row.CreatedAt.UTC().Format(time.RFC3339),
+		CostPerRequestUSD: row.CostPerReqUSD,
 	}
 	if row.StartedAt != nil {
 		s := row.StartedAt.UTC().Format(time.RFC3339)
@@ -242,7 +308,34 @@ func runViewFrom(row *store.RunRow) RunView {
 		e := int(time.Since(*row.StartedAt).Seconds())
 		v.ElapsedS = &e
 	}
+	// finals are only meaningful once an engine push has populated them.
+	if row.P99US != nil && row.TotalRequests != nil {
+		final := &FinalsView{
+			Corrected: PercentilesView{
+				P50US:  derefI64(row.P50US),
+				P95US:  derefI64(row.P95US),
+				P99US:  derefI64(row.P99US),
+				P999US: derefI64(row.P999US),
+			},
+			TotalRequests: derefI64(row.TotalRequests),
+			TotalPass:     derefI64(row.TotalPass),
+		}
+		if final.TotalRequests > 0 {
+			final.CorrectnessPct = float64(final.TotalPass) / float64(final.TotalRequests) * 100.0
+		}
+		if row.CliffRPS != nil {
+			final.CliffRPS = row.CliffRPS
+		}
+		v.Final = final
+	}
 	return v
+}
+
+func derefI64(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 func rawOrEmpty(r json.RawMessage) string {

@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 
+	"github.com/santhosh-tekuri/jsonschema/v5"
 	"github.com/tidwall/gjson"
 )
 
@@ -45,11 +47,12 @@ type Spec struct {
 	Schema   json.RawMessage `json:"schema,omitempty"` // reserved
 }
 
-// Evaluator pre-compiles the regexes and applies the rules to one body at a
-// time. Safe for concurrent use after construction.
+// Evaluator pre-compiles the regexes + JSON Schema and applies the rules to
+// one body at a time. Safe for concurrent use after construction.
 type Evaluator struct {
 	spec     Spec
 	patterns []*regexp.Regexp
+	schema   *jsonschema.Schema // nil when no schema tier is configured
 }
 
 func NewEvaluator(spec Spec) (*Evaluator, error) {
@@ -61,6 +64,20 @@ func NewEvaluator(spec Spec) (*Evaluator, error) {
 		}
 		e.patterns = append(e.patterns, re)
 	}
+	if len(spec.Schema) > 0 {
+		// Compile against a synthetic URL since the schema is inline. The
+		// compiler reads from the resource we add, not the network.
+		c := jsonschema.NewCompiler()
+		const schemaURL = "mem://offload-schema"
+		if err := c.AddResource(schemaURL, strings.NewReader(string(spec.Schema))); err != nil {
+			return nil, fmt.Errorf("schema add: %w", err)
+		}
+		sch, err := c.Compile(schemaURL)
+		if err != nil {
+			return nil, fmt.Errorf("schema compile: %w", err)
+		}
+		e.schema = sch
+	}
 	return e, nil
 }
 
@@ -69,6 +86,18 @@ func NewEvaluator(spec Spec) (*Evaluator, error) {
 // failure verdict, or VerdictPass when all tiers accept. `details` is a short
 // human-readable explanation for the failure (empty on pass).
 func (e *Evaluator) Evaluate(body []byte) (Verdict, string) {
+	// Schema tier runs first: if the body doesn't match the contract, the
+	// downstream path / regex tiers are noise. A non-JSON body fails the
+	// schema tier outright (cannot validate non-JSON against JSON Schema).
+	if e.schema != nil {
+		var doc any
+		if err := json.Unmarshal(body, &doc); err != nil {
+			return VerdictFailSchema, fmt.Sprintf("body is not valid JSON: %v", err)
+		}
+		if err := e.schema.Validate(doc); err != nil {
+			return VerdictFailSchema, firstSchemaError(err)
+		}
+	}
 	// Path tier (JSON-path / value).
 	for _, pa := range e.spec.Paths {
 		got := gjson.GetBytes(body, pa.Path)
@@ -123,4 +152,14 @@ func equalsLoose(got gjson.Result, want any) bool {
 // (and the cost of fetching the spec) when there's nothing to check.
 func (s *Spec) HasAnyRule() bool {
 	return len(s.Paths) > 0 || len(s.Patterns) > 0 || len(s.Schema) > 0
+}
+
+// firstSchemaError pulls a short single-line summary out of the multi-line
+// ValidationError tree the library returns. Persisted into offload_eval.details.
+func firstSchemaError(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, "\n"); i >= 0 {
+		msg = msg[:i]
+	}
+	return msg
 }

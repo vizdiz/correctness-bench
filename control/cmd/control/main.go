@@ -33,6 +33,7 @@ func main() {
 	}
 
 	ctx := context.Background()
+
 	st, err := store.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Error("db connect failed", "err", err.Error())
