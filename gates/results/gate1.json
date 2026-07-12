@@ -1,0 +1,78 @@
+{
+  "gate": 1,
+  "name": "wrk2 agreement (differential matrix, containerized)",
+  "verdict": "PASS",
+  "generated_at": "2026-07-12T19:48:56Z",
+  "params": {
+    "tolerance_pct": 5.0,
+    "percentiles": [
+      "p50",
+      "p99"
+    ],
+    "base_latency_ms": 20,
+    "connections": 100,
+    "duration_s": 45,
+    "rps_swept": [
+      500,
+      1000,
+      2000
+    ],
+    "method": "wrk2 + engine-worker + mock as containers on one docker network"
+  },
+  "matrix": [
+    {
+      "rps": 500,
+      "duration_s": 45,
+      "metric": "p50",
+      "wrk2_us": 23260,
+      "engine_us": 23400,
+      "delta_pct": 0.602,
+      "result": "PASS"
+    },
+    {
+      "rps": 500,
+      "duration_s": 45,
+      "metric": "p99",
+      "wrk2_us": 26670,
+      "engine_us": 25600,
+      "delta_pct": 4.012,
+      "result": "PASS"
+    },
+    {
+      "rps": 1000,
+      "duration_s": 45,
+      "metric": "p50",
+      "wrk2_us": 23070,
+      "engine_us": 23700,
+      "delta_pct": 2.731,
+      "result": "PASS"
+    },
+    {
+      "rps": 1000,
+      "duration_s": 45,
+      "metric": "p99",
+      "wrk2_us": 25840,
+      "engine_us": 25600,
+      "delta_pct": 0.929,
+      "result": "PASS"
+    },
+    {
+      "rps": 2000,
+      "duration_s": 45,
+      "metric": "p50",
+      "wrk2_us": 22730,
+      "engine_us": 23200,
+      "delta_pct": 2.068,
+      "result": "PASS"
+    },
+    {
+      "rps": 2000,
+      "duration_s": 45,
+      "metric": "p99",
+      "wrk2_us": 25390,
+      "engine_us": 25300,
+      "delta_pct": 0.354,
+      "result": "PASS"
+    }
+  ]
+}
