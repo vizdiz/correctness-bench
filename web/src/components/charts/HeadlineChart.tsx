@@ -108,7 +108,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
     .join(' ')
 
   // Gridlines: 5 horizontal on the left scale (0/25/50/75/100%).
-  const gridRows = [0, 0.25, 0.5, 0.75, 1].map((r) => ({
+  const gridRows = [0, 0.5, 1].map((r) => ({
     y: yCorrect(r),
     label: `${Math.round(r * 100)}%`,
   }))
@@ -132,16 +132,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
       aria-label="Correctness vs offered RPS, with corrected p99 latency on the right axis"
       className="overflow-visible"
     >
-      {/* Background */}
-      <rect
-        x={PAD.left}
-        y={PAD.top}
-        width={INNER_W}
-        height={INNER_H}
-        fill="var(--color-surface-2)"
-        rx="6"
-        opacity="0.45"
-      />
       {/* Horizontal gridlines on the correctness scale */}
       {gridRows.map((g, i) => (
         <g key={i}>
@@ -152,7 +142,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
             y2={g.y}
             stroke="var(--color-border)"
             strokeWidth={1}
-            strokeDasharray={i === 0 || i === gridRows.length - 1 ? '' : '2 4'}
           />
           <text
             x={PAD.left - 8}
@@ -168,14 +157,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
       {/* X-axis ticks + labels */}
       {xTicks.map((rps, i) => (
         <g key={i}>
-          <line
-            x1={xScale(rps)}
-            x2={xScale(rps)}
-            y1={PAD.top + INNER_H}
-            y2={PAD.top + INNER_H + 4}
-            stroke="var(--color-border-strong)"
-            strokeWidth={1}
-          />
           <text
             x={xScale(rps)}
             y={PAD.top + INNER_H + 16}
@@ -210,26 +191,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-      {/* Marker dots on correctness for each measured bucket */}
-      {points.map((p, i) => (
-        <circle
-          key={i}
-          cx={xScale(p.rps_mid)}
-          cy={yCorrect(p.pass_rate)}
-          r={2.5}
-          fill="var(--color-correct)"
-        />
-      ))}
-      {/* Axis title — bottom (X) */}
-      <text
-        x={PAD.left + INNER_W / 2}
-        y={H - 6}
-        textAnchor="middle"
-        className="fill-text-muted"
-        style={{ fontSize: 11 }}
-      >
-        Offered RPS (bucket center)
-      </text>
     </svg>
   )
 }

@@ -95,17 +95,8 @@ function ChartSVG({ view }: { view: ViewModel }) {
       aria-label="Per-tick RPS, p99 latency, and pass rate over time"
       className="overflow-visible"
     >
-      <rect
-        x={PAD.left}
-        y={PAD.top}
-        width={INNER_W}
-        height={INNER_H}
-        fill="var(--color-surface-2)"
-        rx="6"
-        opacity="0.45"
-      />
       {/* Horizontal gridlines on pass-rate axis (0/25/50/75/100). */}
-      {[0, 0.25, 0.5, 0.75, 1].map((r, i, arr) => (
+      {[0, 0.5, 1].map((r, i, arr) => (
         <g key={r}>
           <line
             x1={PAD.left}
@@ -114,7 +105,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
             y2={yPass(r)}
             stroke="var(--color-border)"
             strokeWidth={1}
-            strokeDasharray={i === 0 || i === arr.length - 1 ? '' : '2 4'}
           />
           <text
             x={PAD.left + INNER_W + 8}
@@ -142,14 +132,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
       {/* X axis ticks. */}
       {xTicks.map((t) => (
         <g key={t}>
-          <line
-            x1={xScale(t)}
-            x2={xScale(t)}
-            y1={PAD.top + INNER_H}
-            y2={PAD.top + INNER_H + 4}
-            stroke="var(--color-border-strong)"
-            strokeWidth={1}
-          />
           <text
             x={xScale(t)}
             y={PAD.top + INNER_H + 16}
@@ -186,15 +168,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
         strokeWidth={2}
         opacity={0.95}
       />
-      <text
-        x={PAD.left + INNER_W / 2}
-        y={H - 6}
-        textAnchor="middle"
-        className="fill-text-muted"
-        style={{ fontSize: 11 }}
-      >
-        Elapsed (s)
-      </text>
     </svg>
   )
 }

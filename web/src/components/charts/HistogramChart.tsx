@@ -186,15 +186,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
       aria-label="Histogram of per-tick p99 latency"
       className="overflow-visible"
     >
-      <rect
-        x={PAD.left}
-        y={PAD.top}
-        width={INNER_W}
-        height={INNER_H}
-        fill="var(--color-surface-2)"
-        rx="6"
-        opacity="0.45"
-      />
       {/* Y gridlines + labels */}
       {yTicks.map((y, i) => (
         <g key={i}>
@@ -205,7 +196,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
             y2={yScale(y)}
             stroke="var(--color-border)"
             strokeWidth={1}
-            strokeDasharray={i === 0 || i === yTickCount ? '' : '2 4'}
           />
           <text
             x={PAD.left - 8}
@@ -272,15 +262,6 @@ function ChartSVG({ view }: { view: ViewModel }) {
           </text>
         </g>
       ))}
-      <text
-        x={PAD.left + INNER_W / 2}
-        y={H - 6}
-        textAnchor="middle"
-        className="fill-text-muted"
-        style={{ fontSize: 11 }}
-      >
-        Per-tick p99 latency (ms)
-      </text>
     </svg>
   )
 }
