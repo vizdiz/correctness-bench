@@ -36,6 +36,11 @@ func (s *Server) IngestTick(w http.ResponseWriter, r *http.Request) {
 	tick.TS = time.Now().UTC()
 	s.Broker.Publish(id, tick)
 
+	// Persist to run_ticks so a completed run can be replayed (GET .../ticks),
+	// not just watched live. Async — a slow DB write must never stall tick
+	// fan-out (schema hard rule #4).
+	go s.persistTick(id, tick)
+
 	// Offload eval: evaluate every sampled body against this run's spec.
 	// Async so the ingest path isn't blocked on the DB write; spawning N
 	// goroutines per tick is fine - sample_every_n caps N in practice.
@@ -86,6 +91,99 @@ func (s *Server) evalOneSample(runID string, sample sse.SampledResponse) {
 	}); err != nil {
 		s.Log.Warn("offload verdict persist", "run_id", runID, "err", err.Error())
 	}
+}
+
+// persistTick maps a transport tick onto run_ticks columns and writes it.
+// Best-effort: a failed persist is logged, never surfaced to the engine.
+func (s *Server) persistTick(runID string, tick sse.Tick) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var bucketsJSON string
+	if len(tick.Buckets) > 0 {
+		if b, err := json.Marshal(tick.Buckets); err == nil {
+			bucketsJSON = string(b)
+		}
+	}
+	if err := s.Store.InsertTick(ctx, store.InsertTickParams{
+		RunID:           runID,
+		ElapsedS:        int64(tick.ElapsedS),
+		AchievedRPS:     tick.AchievedRps1S,
+		P50US:           int64(tick.PercentilesSoFar.P50US),
+		P99US:           int64(tick.PercentilesSoFar.P99US),
+		BucketsJSON:     bucketsJSON,
+		Total:           int64(tick.ThisTick.Total),
+		Pass:            int64(tick.ThisTick.Pass),
+		FailStatus:      int64(tick.ThisTick.FailStatus),
+		FailLatency:     int64(tick.ThisTick.FailLatency),
+		FailSize:        int64(tick.ThisTick.FailSize),
+		FailContentType: int64(tick.ThisTick.FailContentType),
+	}); err != nil {
+		s.Log.Warn("tick persist", "run_id", runID, "err", err.Error())
+	}
+}
+
+// GetTicks returns a run's persisted per-second ticks, in the same JSON shape
+// as the live SSE `tick` events, so the UI can render a completed run's charts
+// (not just a live one).
+//   GET /v1/runs/{id}/ticks
+func (s *Server) GetTicks(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")
+		return
+	}
+	rows, err := s.Store.GetTicks(r.Context(), id)
+	if err != nil {
+		s.internal(w, "get ticks", err)
+		return
+	}
+	// Cumulative totals aren't stored per-row; recompute them by summing the
+	// per-tick counts in order, so the reconstructed tick matches the live shape.
+	ticks := make([]sse.Tick, 0, len(rows))
+	var cumTotal, cumPass, cumFailStatus uint64
+	for _, row := range rows {
+		var buckets []sse.Bucket
+		if len(row.BucketsJSON) > 0 {
+			_ = json.Unmarshal(row.BucketsJSON, &buckets)
+		}
+		tt := sse.ThisTick{
+			Total:           u64(row.Total),
+			Pass:            u64(row.Pass),
+			FailStatus:      u64(row.FailStatus),
+			FailLatency:     u64(row.FailLatency),
+			FailSize:        u64(row.FailSize),
+			FailContentType: u64(row.FailContentType),
+		}
+		cumTotal += tt.Total
+		cumPass += tt.Pass
+		cumFailStatus += tt.FailStatus
+		ticks = append(ticks, sse.Tick{
+			ElapsedS:         uint64(row.ElapsedS),
+			AchievedRps1S:    f64(row.AchievedRPS),
+			CompletedTotal:   cumTotal,
+			PassTotal:        cumPass,
+			FailStatusTotal:  cumFailStatus,
+			ThisTick:         tt,
+			PercentilesSoFar: sse.PercentilesSoFar{P50US: u64(row.P50US), P99US: u64(row.P99US)},
+			Buckets:          buckets,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ticks": ticks})
+}
+
+func u64(p *int64) uint64 {
+	if p == nil || *p < 0 {
+		return 0
+	}
+	return uint64(*p)
+}
+
+func f64(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // suppress unused-import warning if all callers go away in the future.

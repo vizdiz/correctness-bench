@@ -30,6 +30,7 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/{id}", s.GetRun)
 			r.Post("/{id}/abort", s.AbortRun)
 			r.Get("/{id}/stream", s.StreamRun)
+			r.Get("/{id}/ticks", s.GetTicks)
 			r.Get("/{id}/histogram", s.GetHistogram)
 			r.Get("/{id}/compare/{id2}", s.Compare)
 			r.Post("/{id}/regression-check", s.RegressionCheck)
