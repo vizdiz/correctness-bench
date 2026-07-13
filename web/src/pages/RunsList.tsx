@@ -70,13 +70,13 @@ export function RunsList() {
       </header>
 
       <Card className="mb-4 flex flex-wrap items-center gap-3 px-4 py-3">
-        <div className="inline-flex rounded-md border border-border bg-surface-2/30 p-0.5 text-xs">
+        <div className="inline-flex rounded-[var(--radius)] border border-border bg-surface-2/30 p-0.5 text-xs">
           {STATUS_OPTIONS.map((s) => (
             <button
               key={s}
               onClick={() => setStatusFilter(s)}
               className={cn(
-                'rounded px-2.5 py-1 capitalize transition-colors',
+                'rounded-[calc(var(--radius)-2px)] px-2.5 py-1 capitalize transition-colors',
                 statusFilter === s
                   ? 'bg-accent/15 text-accent'
                   : 'text-text-faint hover:text-text-muted',

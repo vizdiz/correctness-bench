@@ -8,7 +8,7 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const base =
-  'inline-flex items-center justify-center gap-2 rounded-[var(--radius)] px-3.5 py-2 text-sm font-medium ' +
+  'inline-flex items-center justify-center gap-2 rounded-[var(--radius)] px-3 py-1.5 text-sm font-medium ' +
   'transition-colors duration-150 disabled:opacity-50 disabled:pointer-events-none select-none'
 
 const variants: Record<Variant, string> = {

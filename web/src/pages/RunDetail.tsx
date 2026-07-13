@@ -186,7 +186,7 @@ export function RunDetail() {
               : 'No results yet — this updates live as the run streams.'
           }
           actions={
-            <div className="inline-flex rounded-md border border-border bg-surface-2/30 p-0.5 text-xs">
+            <div className="inline-flex rounded-[var(--radius)] border border-border bg-surface-2/30 p-0.5 text-xs">
               {(
                 [
                   ['headline', 'Cliff'],
@@ -197,7 +197,7 @@ export function RunDetail() {
                 <button
                   key={k}
                   onClick={() => setChartTab(k)}
-                  className={`rounded px-2.5 py-1 transition-colors ${
+                  className={`rounded-[calc(var(--radius)-2px)] px-2.5 py-1 transition-colors ${
                     chartTab === k
                       ? 'bg-accent/15 text-accent'
                       : 'text-text-faint hover:text-text-muted'

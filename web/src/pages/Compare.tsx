@@ -266,7 +266,7 @@ function ThresholdInput({
           min={0}
           value={value}
           onChange={(e) => onChange(Number(e.target.value) || 0)}
-          className="w-20 rounded-md border border-border bg-surface-2/30 px-2 py-1 text-right font-mono text-sm"
+          className="w-20 rounded-[var(--radius)] border border-border bg-surface-2/30 px-2 py-1 text-right font-mono text-sm"
         />
         <span className="text-xs text-text-faint">{suffix}</span>
       </span>

@@ -65,6 +65,23 @@
   --color-danger: #e0645a;
 }
 
+/*
+  Spatial system — one scale, applied by role. Everything sits on the 4px grid;
+  avoid half-steps except the two documented control cases below.
+    Radius      rounded-[var(--radius)] for cards/controls/fields;
+                rounded-[calc(var(--radius)-2px)] for buttons nested in a p-0.5
+                segmented control; rounded-full for status pills.
+    Card/panel  px-5 py-4 (header + body share it).
+    Control     px-3 py-1.5 · text-sm   (buttons, nav items, theme toggle).
+    Segmented   container p-0.5; item px-2.5 py-1.
+    Field       px-3 py-2 · text-sm.
+    Pill/badge  px-2 py-0.5 · text-xs.
+    Table cell  px-5 py-3 (px-3 for the checkbox column).
+    Page header mb-6; h1 text-xl; subtitle mt-1 text-sm.
+    Type scale  text-xs labels/meta · text-sm body/controls · text-xl headings ·
+                NumberDisplay text-2xl for the big metrics.
+    Gaps        gap-2 inline · gap-3 toolbar · gap-4 cards · gap-6 major groups.
+*/
 @layer base {
   html,
   body,
