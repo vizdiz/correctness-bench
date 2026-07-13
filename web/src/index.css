@@ -6,35 +6,63 @@
 @import '@fontsource/inter/600.css';
 @import '@fontsource/jetbrains-mono/400.css';
 @import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
 
 /*
-  Design tokens — a dark, high-contrast instrument-panel aesthetic in the spirit
-  of Linear/Stripe: near-black layered surfaces, hairline borders, one vivid
-  accent. Correctness reads green, latency reads blue, failures red — the colors
-  carry meaning for the headline cliff chart later. Exposed to Tailwind v4 via
-  @theme so utilities like `bg-surface`, `text-accent`, `font-mono` work.
+  Design tokens — the "paper/ink/forest" system from the personal site: a light,
+  flat, all-monospace aesthetic. Warm paper background, near-black ink, one forest
+  accent. Forest doubles as the correctness hue (the star metric); latency gets its
+  own graphite so the headline cliff chart keeps two legible lines. Failures red,
+  warnings ochre. Exposed to Tailwind v4 via @theme so utilities like `bg-surface`,
+  `text-accent`, `bg-latency`, `font-mono` work.
 */
 @theme {
-  --color-bg: #08090c;
-  --color-surface: #0e1014;
-  --color-surface-2: #14171d;
-  --color-border: #20242c;
-  --color-border-strong: #2c313a;
+  --color-bg: #f6f6f4;        /* paper */
+  --color-surface: #ffffff;
+  --color-surface-2: #efeee9;
+  --color-border: #dcdbd2;
+  --color-border-strong: #c5c3b6;
 
-  --color-text: #e7e9ee;
-  --color-text-muted: #9aa1ad;
-  --color-text-faint: #646b78;
+  --color-text: #111110;      /* ink */
+  --color-text-muted: #55534c;
+  --color-text-faint: #8a887d;
 
-  --color-accent: #6c8cff; /* electric indigo — primary actions, latency axis */
-  --color-accent-hover: #82a0ff;
-  --color-correct: #34d399; /* correctness axis (green) */
-  --color-warn: #fbbf24;
-  --color-danger: #f87171; /* failures / aborts */
+  --color-accent: #2a6b33;    /* forest — links, primary actions, brand */
+  --color-accent-hover: #21522a;
+  --color-correct: #2a6b33;   /* correctness axis (forest green) */
+  --color-latency: #3f3f46;   /* latency axis — graphite, distinct from forest */
+  --color-warn: #b7791f;      /* ochre */
+  --color-danger: #b4322a;    /* brick red — failures / aborts */
 
-  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
 
-  --radius: 0.625rem;
+  --radius: 0.375rem;
+}
+
+/*
+  Dark mode — an on-brand counterpart of paper/ink/forest: warm near-black
+  surfaces, warm off-white ink, a lifted forest that pops on dark, and a light
+  graphite for the latency line. Unlayered so it overrides the @theme defaults;
+  applied when the <html data-theme="dark"> attribute is set (see index.html).
+*/
+:root[data-theme='dark'] {
+  --color-bg: #100f0d;
+  --color-surface: #171613;
+  --color-surface-2: #201e19;
+  --color-border: #2b2924;
+  --color-border-strong: #3a3831;
+
+  --color-text: #ece9e1;
+  --color-text-muted: #a6a294;
+  --color-text-faint: #706d62;
+
+  --color-accent: #5aa869;
+  --color-accent-hover: #6dbb7b;
+  --color-correct: #5aa869;
+  --color-latency: #b4b1a8;
+  --color-warn: #d9a441;
+  --color-danger: #e0645a;
 }
 
 @layer base {

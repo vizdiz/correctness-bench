@@ -87,7 +87,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
         className="flex items-center justify-center rounded-[var(--radius)] border border-border bg-surface-2/30 text-xs text-text-faint"
         style={{ width: W, height: H }}
       >
-        Waiting for ticks — start the engine with --push-to + --run-id pointed at this run.
+        No results to plot yet — this chart fills in as the run streams.
       </div>
     )
   }
@@ -200,7 +200,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
         </text>
       ))}
       {/* Latency line (blue) — drawn under the correctness line. */}
-      <path d={latencyPath} fill="none" stroke="var(--color-accent)" strokeWidth={2} opacity={0.85} />
+      <path d={latencyPath} fill="none" stroke="var(--color-latency)" strokeWidth={2} opacity={0.85} />
       {/* Correctness line (green) — the headline. */}
       <path
         d={correctnessPath}
@@ -242,7 +242,7 @@ function Legend() {
         Correctness (left)
       </span>
       <span className="inline-flex items-center gap-2">
-        <span className="inline-block h-0.5 w-6 bg-accent" />
+        <span className="inline-block h-0.5 w-6 bg-latency" />
         Latency p99 (right)
       </span>
     </div>

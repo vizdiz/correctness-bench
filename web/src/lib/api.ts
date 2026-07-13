@@ -171,6 +171,11 @@ export const api = {
 
   getRun: (id: string) => req<RunView>(`/v1/runs/${id}`),
 
+  // Persisted per-second ticks — lets a completed run render its charts, not
+  // just a live one. Same shape as the SSE `tick` events.
+  getTicks: (id: string) =>
+    req<{ ticks: Tick[] }>(`/v1/runs/${id}/ticks`).then((r) => r.ticks ?? []),
+
   listRuns: (params: { status?: string; limit?: number; cursor?: string } = {}) => {
     const q = new URLSearchParams()
     if (params.status) q.set('status', params.status)

@@ -67,7 +67,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
         className="flex items-center justify-center rounded-[var(--radius)] border border-border bg-surface-2/30 text-xs text-text-faint"
         style={{ width: W, height: H }}
       >
-        Waiting for ticks — start the engine with --push-to + --run-id pointed at this run.
+        No results to plot yet — this chart fills in as the run streams.
       </div>
     )
   }
@@ -182,7 +182,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
       <path
         d={path(points, (p) => yRPS(p.rps))}
         fill="none"
-        stroke="var(--color-accent)"
+        stroke="var(--color-latency)"
         strokeWidth={2}
         opacity={0.95}
       />
@@ -203,7 +203,7 @@ function Legend() {
   return (
     <div className="mt-3 flex items-center justify-center gap-6 text-xs text-text-muted">
       <span className="inline-flex items-center gap-2">
-        <span className="inline-block h-0.5 w-6 bg-accent" />
+        <span className="inline-block h-0.5 w-6 bg-latency" />
         Achieved RPS
       </span>
       <span className="inline-flex items-center gap-2">

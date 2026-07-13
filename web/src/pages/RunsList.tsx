@@ -60,8 +60,8 @@ export function RunsList() {
       <header className="mb-6 flex items-end justify-between">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Runs</h1>
-          <p className="mt-1 text-sm text-text-muted">
-            Every benchmark execution. The cliff lives in the details view.
+          <p className="mt-1 max-w-xl text-sm text-text-muted">
+            Find the load at which an API's responses start going wrong — while its latency still looks healthy.
           </p>
         </div>
         <Link to="/runs/new">

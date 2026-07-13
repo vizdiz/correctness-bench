@@ -30,6 +30,26 @@ export function RunDetail() {
   }
   useEffect(load, [id])
 
+  // Seed from persisted history so a completed run renders its charts (live SSE
+  // only carries ticks while the run is streaming). Live ticks append on top,
+  // deduped by elapsed_s so a running run doesn't double-count.
+  useEffect(() => {
+    if (!id) return
+    api
+      .getTicks(id)
+      .then((history) => {
+        if (history.length === 0) return
+        setTicks((prev) => {
+          const seen = new Set(prev.map((t) => t.elapsed_s))
+          const merged = [...history.filter((t) => !seen.has(t.elapsed_s)), ...prev]
+          return merged.sort((a, b) => a.elapsed_s - b.elapsed_s).slice(-MAX_TICKS_HISTORY)
+        })
+      })
+      .catch(() => {
+        /* history is best-effort — live SSE still works */
+      })
+  }, [id])
+
   // Live SSE subscription. The connection survives the run; we close on unmount.
   useEffect(() => {
     if (!id) return
@@ -41,6 +61,7 @@ export function RunDetail() {
       try {
         const tick = JSON.parse((event as MessageEvent).data) as Tick
         setTicks((prev) => {
+          if (prev.some((t) => t.elapsed_s === tick.elapsed_s)) return prev
           const next = [...prev, tick]
           return next.length > MAX_TICKS_HISTORY ? next.slice(-MAX_TICKS_HISTORY) : next
         })
@@ -99,7 +120,7 @@ export function RunDetail() {
                   ? 'border-correct/40 bg-correct/10 text-correct'
                   : 'border-border text-text-faint'
               }`}
-              title={streamLive ? 'SSE connected' : 'SSE not connected'}
+              title={streamLive ? 'Live updates connected' : 'Live updates paused'}
             >
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
@@ -161,8 +182,8 @@ export function RunDetail() {
           }
           subtitle={
             ticks.length > 0
-              ? `${ticks.length} live tick(s) · pass=${latest?.pass_total} fail_status=${latest?.fail_status_total}`
-              : 'Live via SSE - start an engine worker pushing to this run.'
+              ? `${ticks.length} data point(s) · ${latest?.pass_total} passed · ${latest?.fail_status_total} wrong-status`
+              : 'No results yet — this updates live as the run streams.'
           }
           actions={
             <div className="inline-flex rounded-md border border-border bg-surface-2/30 p-0.5 text-xs">

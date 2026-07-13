@@ -158,7 +158,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
         className="flex items-center justify-center rounded-[var(--radius)] border border-border bg-surface-2/30 text-xs text-text-faint"
         style={{ width: W, height: H }}
       >
-        Waiting for ticks — start the engine with --push-to + --run-id pointed at this run.
+        No results to plot yet — this chart fills in as the run streams.
       </div>
     )
   }
@@ -244,7 +244,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
             y={y}
             width={wpx}
             height={h}
-            fill="var(--color-accent)"
+            fill="var(--color-latency)"
             opacity={b.count > 0 ? 0.75 : 0}
           />
         )
@@ -295,7 +295,7 @@ function Legend({
   return (
     <div className="mt-3 flex items-center justify-center gap-6 text-xs text-text-muted">
       <span className="inline-flex items-center gap-2">
-        <span className="inline-block h-3 w-3 bg-accent opacity-75" />
+        <span className="inline-block h-3 w-3 bg-latency opacity-75" />
         {source === 'server'
           ? 'HDR distribution (server-binned)'
           : 'Per-tick p99 sampled'}
