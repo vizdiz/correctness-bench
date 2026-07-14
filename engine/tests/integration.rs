@@ -44,6 +44,9 @@ async fn engine_hits_target_rps_against_healthy_mock() {
         ramp: false,
         sample_every_n: 0,
         max_sampled_body_bytes: 0,
+        rate_limit_action: engine::RlAction::Backoff,
+        max_backoff_ms: 5000,
+        record_onset: true,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -111,6 +114,9 @@ async fn status_tier_assertion_catches_fast500() {
         ramp: false,
         sample_every_n: 0,
         max_sampled_body_bytes: 0,
+        rate_limit_action: engine::RlAction::Backoff,
+        max_backoff_ms: 5000,
+        record_onset: true,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -151,6 +157,9 @@ async fn size_tier_assertion_catches_truncate() {
         ramp: false,
         sample_every_n: 0,
         max_sampled_body_bytes: 0,
+        rate_limit_action: engine::RlAction::Backoff,
+        max_backoff_ms: 5000,
+        record_onset: true,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -191,6 +200,9 @@ async fn latency_tier_assertion_catches_slow_ok() {
         ramp: false,
         sample_every_n: 0,
         max_sampled_body_bytes: 0,
+        rate_limit_action: engine::RlAction::Backoff,
+        max_backoff_ms: 5000,
+        record_onset: true,
     };
 
     let report = run(spec).await.expect("run completed");
@@ -231,6 +243,9 @@ async fn offload_sampling_captures_bodies_at_the_configured_cadence() {
         ramp: false,
         sample_every_n: 10,
         max_sampled_body_bytes: 4096,
+        rate_limit_action: engine::RlAction::Backoff,
+        max_backoff_ms: 5000,
+        record_onset: true,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Tick>();

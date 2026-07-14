@@ -95,6 +95,16 @@ struct Cli {
     /// Cap on captured body length (bytes); truncated beyond. 0 = no cap.
     #[arg(long, default_value_t = 8192)]
     max_sampled_body_bytes: u32,
+
+    /// What to do on HTTP 429 (rate limit). One of: backoff (honor Retry-After,
+    /// default), continue (keep firing, just count), abort (stop the run). A 429
+    /// is never counted as a correctness failure regardless of this setting.
+    #[arg(long, default_value = "backoff")]
+    rate_limit_action: String,
+
+    /// Cap on Retry-After honoring for `--rate-limit-action backoff`, in ms.
+    #[arg(long, default_value_t = 5000)]
+    max_backoff_ms: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -139,6 +149,13 @@ fn main() -> anyhow::Result<()> {
             ramp: cli.ramp,
             sample_every_n: cli.sample_every_n,
             max_sampled_body_bytes: cli.max_sampled_body_bytes,
+            rate_limit_action: match cli.rate_limit_action.to_ascii_lowercase().as_str() {
+                "continue" => engine::RlAction::Continue,
+                "abort" => engine::RlAction::Abort,
+                _ => engine::RlAction::Backoff,
+            },
+            max_backoff_ms: cli.max_backoff_ms,
+            record_onset: true,
         };
 
         eprintln!(
@@ -192,6 +209,7 @@ fn main() -> anyhow::Result<()> {
                                 entry.rps_hi = b.rps_hi;
                                 entry.total += b.total;
                                 entry.pass += b.pass;
+                                entry.rate_limited += b.rate_limited;
                             }
                         }
                         if let (Some(url), Some(client)) = (&push_url, &http) {
@@ -248,6 +266,9 @@ fn main() -> anyhow::Result<()> {
                 "status": "completed",
                 "corrected_hist_b64": corrected_b64,
                 "uncorrected_hist_b64": uncorrected_b64,
+                "rate_limited": report.rate_limited as i64,
+                "rate_limit_onset_rps": report.first_429_rps,
+                "backoff_us_total": report.backoff_us_total as i64,
             });
             let client = reqwest::Client::new();
             let req = client.post(&finalize_url).json(&body);
@@ -298,8 +319,11 @@ fn main() -> anyhow::Result<()> {
             (report.corrected.p99_us as f64 - report.uncorrected.p99_us as f64) / 1000.0
         );
         println!();
-        let pass_rate = if report.completed > 0 {
-            report.pass as f64 / report.completed as f64 * 100.0
+        // Correctness denominator excludes rate-limited (429) responses — a 429
+        // is neither a pass nor a fail, and never folded into the API's score.
+        let correctness_denom = report.completed.saturating_sub(report.rate_limited);
+        let pass_rate = if correctness_denom > 0 {
+            report.pass as f64 / correctness_denom as f64 * 100.0
         } else {
             0.0
         };
@@ -316,7 +340,7 @@ fn main() -> anyhow::Result<()> {
         };
         println!(
             "  Correctness        {} / {} pass  ({:.1}%)  (expected status: {})",
-            report.pass, report.completed, pass_rate, expected_label
+            report.pass, correctness_denom, pass_rate, expected_label
         );
         println!(
             "  Fail by tier       status={}  latency={}  size={}  content_type={}",
@@ -324,6 +348,18 @@ fn main() -> anyhow::Result<()> {
             report.fail_latency,
             report.fail_size,
             report.fail_content_type,
+        );
+        // Rate limiting is reported on its own line — OUR load artifact, kept
+        // out of the correctness tally above.
+        let onset_label = report
+            .first_429_rps
+            .map(|r| format!("{r:.0} rps"))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!(
+            "  Rate limited (429) {}  (onset {}, backoff {:.1}s total)",
+            report.rate_limited,
+            onset_label,
+            report.backoff_us_total as f64 / 1_000_000.0,
         );
         Ok::<_, anyhow::Error>(())
     })?;
@@ -341,6 +377,9 @@ struct BucketCounts {
     rps_hi: f64,
     total: u64,
     pass: u64,
+    /// 429s in this bucket — subtracted from `total` to form the correctness
+    /// denominator so rate limiting never manufactures a false cliff.
+    rate_limited: u64,
 }
 
 /// detect_cliff_rps: the lowest offered-RPS bucket where the cumulative pass
@@ -353,10 +392,13 @@ fn detect_cliff_rps(
     min_samples: u64,
 ) -> Option<f64> {
     for (_, b) in buckets.iter() {
-        if b.total < min_samples {
+        // Correctness denominator excludes 429s — they are OUR load artifact,
+        // not the API degrading.
+        let denom = b.total.saturating_sub(b.rate_limited);
+        if denom < min_samples {
             continue;
         }
-        let pass_rate = b.pass as f64 / b.total as f64;
+        let pass_rate = b.pass as f64 / denom as f64;
         if pass_rate < threshold {
             return Some((b.rps_lo + b.rps_hi) / 2.0);
         }

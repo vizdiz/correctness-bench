@@ -26,9 +26,16 @@ type Server struct {
 	Log     *slog.Logger
 	Broker  *sse.Broker
 	Offload *offload.Cache
+	// CoordinatorURL is the coordinator admin base; control dispatches runs there.
+	// SelfURL is control's own base URL as the coordinator reaches it (for the
+	// tick/finalize callbacks). Empty CoordinatorURL disables auto-dispatch.
+	CoordinatorURL string
+	SelfURL        string
+	// dispatch client with no timeout — /admin/runs blocks for the run duration.
+	dispatchClient *http.Client
 }
 
-func NewServer(s *store.Store, log *slog.Logger) *Server {
+func NewServer(s *store.Store, log *slog.Logger, coordinatorURL, selfURL string) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -39,7 +46,15 @@ func NewServer(s *store.Store, log *slog.Logger) *Server {
 		}
 		return offload.ParseSpecFromAssert(raw)
 	})
-	return &Server{Store: s, Log: log, Broker: sse.NewBroker(), Offload: cache}
+	return &Server{
+		Store:          s,
+		Log:            log,
+		Broker:         sse.NewBroker(),
+		Offload:        cache,
+		CoordinatorURL: coordinatorURL,
+		SelfURL:        selfURL,
+		dispatchClient: &http.Client{},
+	}
 }
 
 const maxBodyBytes = 1 << 20 // 1 MiB cap on the POST /v1/runs JSON
@@ -112,9 +127,20 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		"run_id", id, "url", req.Target.URL, "method", req.Target.Method,
 		"target_rps", req.TargetRPS, "duration_s", req.DurationS)
 
+	// Fire the fleet. The request (incl. the in-memory, un-scrubbed target
+	// headers) is handed to the dispatcher, which POSTs it to the coordinator
+	// and streams ticks/finalize back. Async: /admin/runs blocks for the whole
+	// run. A copy is passed so it outlives this handler.
+	status := "queued"
+	if s.CoordinatorURL != "" {
+		reqCopy := req
+		go s.dispatchToCoordinator(id, &reqCopy)
+		status = "running"
+	}
+
 	writeJSON(w, http.StatusCreated, CreateRunResponse{
 		RunID:            id,
-		Status:           "queued",
+		Status:           status,
 		EstimatedCostUSD: req.EstimatedCostUSD,
 	})
 }

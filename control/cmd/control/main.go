@@ -43,7 +43,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewServer(st, log).Routes(),
+		Handler:           api.NewServer(st, log, cfg.CoordinatorURL, cfg.SelfURL).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

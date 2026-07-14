@@ -117,12 +117,16 @@ export interface Tick {
     fail_latency: number
     fail_size: number
     fail_content_type: number
+    /** 429s this tick. OUR load artifact, never a correctness failure. */
+    rate_limited?: number
   }
   /** Running corrected p50/p99 latency snapshot (api.md `percentiles_so_far`). */
   percentiles_so_far: { p50_us: number; p99_us: number }
   /** Per-RPS bucket entries attributable to this tick. Clients accumulate
       across ticks to build the correctness-vs-load curve. */
   buckets?: Bucket[]
+  /** Offered RPS where the first 429 appeared, run-wide. Null until one does. */
+  rate_limit_onset_rps?: number | null
   ts?: string
 }
 
@@ -135,6 +139,7 @@ export interface Bucket {
   fail_latency: number
   fail_size: number
   fail_content_type: number
+  rate_limited?: number
 }
 
 export interface ApiErrorBody {

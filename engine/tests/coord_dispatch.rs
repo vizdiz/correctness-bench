@@ -102,6 +102,7 @@ async fn dispatch_aggregates_across_two_workers() {
         min_body_bytes: None,
         max_body_bytes: None,
         content_type: None,
+        target_headers: Default::default(),
     };
 
     let summary = dispatch(state.clone(), spec)
@@ -178,6 +179,7 @@ async fn dispatch_merges_hdr_snapshots_across_workers() {
         min_body_bytes: None,
         max_body_bytes: None,
         content_type: None,
+        target_headers: Default::default(),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AggregatedTick>();
@@ -306,6 +308,7 @@ async fn dispatch_gate3_half_plus_half_equals_full() {
                 min_body_bytes: None,
                 max_body_bytes: None,
                 content_type: None,
+                target_headers: Default::default(),
             };
             let (tx, mut rx) =
                 tokio::sync::mpsc::unbounded_channel::<AggregatedTick>();

@@ -21,6 +21,7 @@ type InsertTickParams struct {
 	FailLatency     int64
 	FailSize        int64
 	FailContentType int64
+	RateLimited     int64
 }
 
 // InsertTick persists one tick to the run_ticks hypertable. Called async from
@@ -29,14 +30,14 @@ func (s *Store) InsertTick(ctx context.Context, p InsertTickParams) error {
 	const q = `
 INSERT INTO run_ticks (
   run_id, ts, elapsed_s, offered_rps, achieved_rps, p50_us, p99_us, buckets,
-  total, pass, fail_status, fail_latency, fail_size, fail_content_type
+  total, pass, fail_status, fail_latency, fail_size, fail_content_type, rate_limited
 ) VALUES (
   $1, $2, $3, $4, $4, $5, $6, NULLIF($7, '')::jsonb,
-  $8, $9, $10, $11, $12, $13
+  $8, $9, $10, $11, $12, $13, $14
 )`
 	_, err := s.pool.Exec(ctx, q,
 		p.RunID, time.Now().UTC(), p.ElapsedS, p.AchievedRPS, p.P50US, p.P99US, p.BucketsJSON,
-		p.Total, p.Pass, p.FailStatus, p.FailLatency, p.FailSize, p.FailContentType,
+		p.Total, p.Pass, p.FailStatus, p.FailLatency, p.FailSize, p.FailContentType, p.RateLimited,
 	)
 	return err
 }
@@ -54,6 +55,7 @@ type TickRow struct {
 	FailLatency     *int64
 	FailSize        *int64
 	FailContentType *int64
+	RateLimited     *int64
 }
 
 // GetTicks returns a run's persisted per-second ticks ordered by elapsed_s.
@@ -61,7 +63,7 @@ type TickRow struct {
 func (s *Store) GetTicks(ctx context.Context, runID string) ([]TickRow, error) {
 	const q = `
 SELECT elapsed_s, achieved_rps, p50_us, p99_us, buckets,
-       total, pass, fail_status, fail_latency, fail_size, fail_content_type
+       total, pass, fail_status, fail_latency, fail_size, fail_content_type, rate_limited
 FROM run_ticks WHERE run_id = $1 ORDER BY elapsed_s ASC`
 	rows, err := s.pool.Query(ctx, q, runID)
 	if err != nil {
@@ -73,7 +75,7 @@ FROM run_ticks WHERE run_id = $1 ORDER BY elapsed_s ASC`
 		var t TickRow
 		if err := rows.Scan(
 			&t.ElapsedS, &t.AchievedRPS, &t.P50US, &t.P99US, &t.BucketsJSON,
-			&t.Total, &t.Pass, &t.FailStatus, &t.FailLatency, &t.FailSize, &t.FailContentType,
+			&t.Total, &t.Pass, &t.FailStatus, &t.FailLatency, &t.FailSize, &t.FailContentType, &t.RateLimited,
 		); err != nil {
 			return nil, err
 		}

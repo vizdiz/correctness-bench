@@ -118,6 +118,7 @@ func (s *Server) persistTick(runID string, tick sse.Tick) {
 		FailLatency:     int64(tick.ThisTick.FailLatency),
 		FailSize:        int64(tick.ThisTick.FailSize),
 		FailContentType: int64(tick.ThisTick.FailContentType),
+		RateLimited:     int64(tick.ThisTick.RateLimited),
 	}); err != nil {
 		s.Log.Warn("tick persist", "run_id", runID, "err", err.Error())
 	}
@@ -154,6 +155,7 @@ func (s *Server) GetTicks(w http.ResponseWriter, r *http.Request) {
 			FailLatency:     u64(row.FailLatency),
 			FailSize:        u64(row.FailSize),
 			FailContentType: u64(row.FailContentType),
+			RateLimited:     u64(row.RateLimited),
 		}
 		cumTotal += tt.Total
 		cumPass += tt.Pass

@@ -12,6 +12,12 @@ type Config struct {
 	// docker-compose); set AUTO_MIGRATE=false when migrations run as a separate
 	// deploy step or the schema is already applied.
 	AutoMigrate bool
+	// CoordinatorURL is the coordinator's admin HTTP base; control POSTs runs
+	// there to fire the fleet.
+	CoordinatorURL string
+	// SelfURL is control's own base URL as reachable FROM the coordinator, used
+	// to build the tick/finalize callback URLs the coordinator pushes to.
+	SelfURL string
 }
 
 func Load() Config {
@@ -19,6 +25,8 @@ func Load() Config {
 		DatabaseURL: getenv("DATABASE_URL", "postgres://bench:bench@localhost:5432/bench?sslmode=disable"),
 		Addr:        getenv("CONTROL_ADDR", ":8000"),
 		AutoMigrate: getenv("AUTO_MIGRATE", "true") != "false",
+		CoordinatorURL: getenv("COORDINATOR_ADMIN_URL", "http://localhost:9091"),
+		SelfURL:        getenv("CONTROL_SELF_URL", "http://localhost:8000"),
 	}
 }
 

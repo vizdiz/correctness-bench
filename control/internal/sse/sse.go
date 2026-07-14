@@ -25,7 +25,10 @@ type Tick struct {
 	PercentilesSoFar PercentilesSoFar  `json:"percentiles_so_far"`
 	Buckets          []Bucket          `json:"buckets,omitempty"`
 	Sampled          []SampledResponse `json:"sampled,omitempty"`
-	TS               time.Time         `json:"ts,omitempty"` // server-stamped on ingest
+	// Rate limit is OUR load artifact, never folded into correctness. Onset is
+	// the offered-RPS where the first 429 appeared (nil until one does).
+	RateLimitOnsetRPS *float64  `json:"rate_limit_onset_rps,omitempty"`
+	TS                time.Time `json:"ts,omitempty"` // server-stamped on ingest
 }
 
 // SampledResponse is one captured response body shipped by the worker for the
@@ -50,6 +53,7 @@ type Bucket struct {
 	FailLatency     uint64  `json:"fail_latency"`
 	FailSize        uint64  `json:"fail_size"`
 	FailContentType uint64  `json:"fail_content_type"`
+	RateLimited     uint64  `json:"rate_limited"`
 }
 
 // ThisTick holds the counts attributable to JUST the last 1 s window. Per-tick
@@ -61,6 +65,9 @@ type ThisTick struct {
 	FailLatency     uint64 `json:"fail_latency"`
 	FailSize        uint64 `json:"fail_size"`
 	FailContentType uint64 `json:"fail_content_type"`
+	// 429s are OUR load artifact, never folded into correctness. Correctness is
+	// measured over (total - rate_limited).
+	RateLimited uint64 `json:"rate_limited"`
 }
 
 // PercentilesSoFar is the running corrected p50/p99 latency snapshot. api.md

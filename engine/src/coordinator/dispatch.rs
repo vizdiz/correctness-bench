@@ -38,6 +38,9 @@ pub struct DispatchSpec {
     pub min_body_bytes: Option<i32>,
     pub max_body_bytes: Option<i32>,
     pub content_type: Option<String>,
+    /// Request headers (auth / custom) carried to the target via
+    /// bench.proto Target.headers. Never persisted or logged by anyone.
+    pub target_headers: std::collections::HashMap<String, String>,
 }
 
 /// Result of a `dispatch` call. Counts are summed across every worker that
@@ -53,6 +56,12 @@ pub struct DispatchSummary {
     pub total_fail_latency: u64,
     pub total_fail_size: u64,
     pub total_fail_content_type: u64,
+    /// Total 429s across the fleet. OUR load artifact — never folded into the
+    /// correctness totals above.
+    pub total_rate_limited: u64,
+    /// Minimum non-null onset across workers: the lowest offered-RPS-at-send at
+    /// which any worker first saw a 429. `None` if no worker was rate limited.
+    pub first_429_rps: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -89,6 +98,9 @@ pub struct AggregatedTick {
     pub this_tick: AggThisTick,
     pub percentiles_so_far: AggPercentiles,
     pub buckets: Vec<AggBucket>,
+    /// Offered RPS at which the fleet first saw a 429 (minimum non-null onset
+    /// across workers). `null` until some worker is rate limited.
+    pub rate_limit_onset_rps: Option<f64>,
     /// V2-deflate of the merged corrected HDR for this tick across all
     /// workers. Skipped from JSON (control gets `percentiles_so_far` and the
     /// raw bytes ride only on the in-process channel + the admin /finalize
@@ -110,6 +122,8 @@ pub struct AggThisTick {
     pub fail_latency: u64,
     pub fail_size: u64,
     pub fail_content_type: u64,
+    /// 429s across the fleet this tick. Outside the correctness denominator.
+    pub rate_limited: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -129,6 +143,9 @@ pub struct AggBucket {
     pub fail_latency: u64,
     pub fail_size: u64,
     pub fail_content_type: u64,
+    /// 429s in this aggregated bucket. Excluded from the correctness
+    /// denominator (`total - rate_limited`).
+    pub rate_limited: u64,
 }
 
 /// Dispatch a run without live ticks. Returns the final aggregated totals.
@@ -212,6 +229,13 @@ pub async fn dispatch_with_ticks(
         summary.total_fail_latency += ws.fail_latency;
         summary.total_fail_size += ws.fail_size;
         summary.total_fail_content_type += ws.fail_content_type;
+        summary.total_rate_limited += ws.rate_limited;
+        if let Some(onset) = ws.first_429_rps {
+            summary.first_429_rps = Some(match summary.first_429_rps {
+                Some(cur) => cur.min(onset),
+                None => onset,
+            });
+        }
     }
     Ok(summary)
 }
@@ -225,6 +249,10 @@ struct WorkerSummary {
     fail_latency: u64,
     fail_size: u64,
     fail_content_type: u64,
+    rate_limited: u64,
+    /// This worker's onset (offered-RPS-at-send of its first 429), carried up
+    /// from `Partial.rate_limit.first_429_rps`. `None` if never rate limited.
+    first_429_rps: Option<f64>,
 }
 
 #[tracing::instrument(
@@ -263,6 +291,17 @@ async fn run_one_worker(
                 s.fail_latency += b.fail_latency;
                 s.fail_size += b.fail_size;
                 s.fail_content_type += b.fail_content_type;
+                s.rate_limited += b.rate_limited;
+            }
+            // Carry the onset from the rate-limit signal (run-wide, so every
+            // tick after the first 429 repeats it). Keep the minimum.
+            if let Some(rl) = p.rate_limit.as_ref() {
+                if let Some(onset) = rl.first_429_rps {
+                    s.first_429_rps = Some(match s.first_429_rps {
+                        Some(cur) => cur.min(onset),
+                        None => onset,
+                    });
+                }
             }
             if p.r#final {
                 s.finished = true;
@@ -324,8 +363,11 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
         fail_latency: 0,
         fail_size: 0,
         fail_content_type: 0,
+        rate_limited: 0,
     };
     let mut achieved_rps_1s = 0.0_f64;
+    // Minimum non-null onset across workers reporting this tick.
+    let mut rate_limit_onset_rps: Option<f64> = None;
     // Sum each worker's buckets into one combined Bucket for this tick.
     // Single bucket per tick today (matches engine's emission shape).
     let mut combined: Option<AggBucket> = None;
@@ -347,6 +389,14 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
             }
         }
         achieved_rps_1s += p.achieved_rps;
+        if let Some(rl) = p.rate_limit.as_ref() {
+            if let Some(onset) = rl.first_429_rps {
+                rate_limit_onset_rps = Some(match rate_limit_onset_rps {
+                    Some(cur) => cur.min(onset),
+                    None => onset,
+                });
+            }
+        }
         for b in &p.buckets {
             this.total += b.total;
             this.pass += b.pass;
@@ -354,6 +404,7 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
             this.fail_latency += b.fail_latency;
             this.fail_size += b.fail_size;
             this.fail_content_type += b.fail_content_type;
+            this.rate_limited += b.rate_limited;
             combined = Some(match combined.take() {
                 None => AggBucket {
                     rps_lo: b.rps_lo,
@@ -364,6 +415,7 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
                     fail_latency: b.fail_latency,
                     fail_size: b.fail_size,
                     fail_content_type: b.fail_content_type,
+                    rate_limited: b.rate_limited,
                 },
                 Some(mut acc) => {
                     acc.total += b.total;
@@ -372,6 +424,7 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
                     acc.fail_latency += b.fail_latency;
                     acc.fail_size += b.fail_size;
                     acc.fail_content_type += b.fail_content_type;
+                    acc.rate_limited += b.rate_limited;
                     acc
                 }
             });
@@ -393,6 +446,7 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
         fail_latency: this.fail_latency,
         fail_size: this.fail_size,
         fail_content_type: this.fail_content_type,
+        rate_limited: this.rate_limited,
     }];
     // `combined` is currently unused since we re-bucket on the aggregate axis;
     // kept here as a hook for when worker-local buckets matter (mixed loads).
@@ -422,6 +476,7 @@ fn aggregate_tick<'a, I: IntoIterator<Item = &'a Partial>>(
         this_tick: this,
         percentiles_so_far,
         buckets,
+        rate_limit_onset_rps,
         merged_hist_v2,
         merged_uncorrected_hist_v2,
     }
@@ -448,7 +503,7 @@ fn build_assignment(
         target: Some(Target {
             url: spec.target_url.clone(),
             method,
-            headers: Default::default(),
+            headers: spec.target_headers.clone(),
             body: vec![],
             timeout_ms: spec.timeout_ms as i32,
             verify_tls: true,
