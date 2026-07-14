@@ -84,17 +84,24 @@ curl -sX POST localhost:8000/v1/comparisons -H 'content-type: application/json' 
 
 ## Status
 
-Phase 1, gate-verified (committed artifacts in `gates/results/`):
+Phase 1, gate-verified. Each gate is objective and runnable; results are committed in `gates/results/`.
 
-| gate | proves | runner |
+| gate | proves | result |
 |------|--------|--------|
-| #1 wrk2 agreement | corrected p50/p99 within ±5% of wrk2 | `gates/gate1_containers.sh` |
-| #2 oracle | injected fail% == reported fail% | `gates/gate2_oracle.sh` |
-| #3 fleet merge | two half-load workers ≈ one full-load run | `gates/gate3_merge.sh` |
+| #1 wrk2 agreement | corrected p50/p99 within ±5% of wrk2 | green - `gate1.json` (runner: `gates/gate1_containers.sh`) |
+| #2 oracle | injected fail% == reported fail% | green - `gate2.json` (runner: `gates/gate2_oracle.sh`) |
+| #3 fleet merge | two half-load workers ≈ one full-load run | green - `gate3.json` (runner: `gates/gate3_merge.sh`) |
 
-Shipped: dispatch, 429 handling, abort propagation, cost auto-abort, worker-death degradation, coordinator-restart re-registration, concurrent compare, canary-verified credential custody.
+Verified end to end:
 
-Not in this build: OpenTelemetry tracing, Jaeger/Grafana dashboards, browser visual regression. Logs are JSON to stdout (`docker compose logs <service>`). A Loki/Grafana stack exists behind `docker compose --profile observability up` but the apps aren't OTLP-instrumented.
+- create a run → fleet fires → live SSE ticks → persisted history → completed
+- abort propagates to the workers
+- a killed worker degrades gracefully (`WORKER_LOST`, honest effective RPS)
+- a restarted coordinator re-learns its fleet within ~10s
+- concurrent A/B comparison under one schedule
+- credential custody canary-verified (keys never reach the DB or logs)
+
+Not in this build (out of Phase-1 scope): OpenTelemetry tracing, Jaeger/Grafana dashboards, browser visual regression. Logs are JSON to stdout (`docker compose logs <service>`); a Loki/Grafana stack is available behind `docker compose --profile observability up`, but the apps aren't OTLP-instrumented.
 
 ## Layout
 
