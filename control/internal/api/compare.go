@@ -81,11 +81,13 @@ func (s *Server) Compare(w http.ResponseWriter, r *http.Request) {
 		b.Offload = &OffloadCountsView{Pass: c.Pass, FailSchema: c.FailSchema, FailValue: c.FailValue, FailRegex: c.FailRegex}
 	}
 
+	// Fair when the two runs were fired together under one epoch.
+	concurrent, _ := s.Store.RunsWereComparedTogether(r.Context(), idA, idB)
 	resp := CompareResponse{
 		A:        a,
 		B:        b,
 		WinnerBy: pickWinners(rowA, rowB),
-		Fairness: pickFairness(rowA, rowB),
+		Fairness: pickFairness(rowA, rowB, concurrent),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -156,11 +158,12 @@ func pickWinners(a, b *store.RunRow) WinnerBy {
 	}
 }
 
-func pickFairness(a, b *store.RunRow) Fairness {
+func pickFairness(a, b *store.RunRow, concurrent bool) Fairness {
 	return Fairness{
-		// v1: assume sequential dispatch (not interleaved) since CLI fires one
-		// run at a time. UI uses this to warn that A/B drift may bias.
-		Interleaved:    false,
+		// True when the two runs were fired together under one shared epoch
+		// (concurrent A/B) - no sequential time confound. False for a post-hoc
+		// join of two independently-run rows.
+		Interleaved:    concurrent,
 		SameAssertSpec: false, // assert_spec equality check is out of scope until we read it
 		SameLoadShape:  a.TargetRPS == b.TargetRPS && a.DurationS == b.DurationS,
 	}

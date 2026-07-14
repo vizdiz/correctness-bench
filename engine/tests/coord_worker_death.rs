@@ -268,7 +268,7 @@ async fn midrun_worker_death_yields_warning_and_completes_with_survivor() {
         min_body_bytes: None,
         max_body_bytes: None,
         content_type: None,
-        target_headers: Default::default(),
+        target_headers: Default::default(), epoch_unix_us: 0,
     };
 
     let summary = dispatch_with_ticks(state.clone(), spec, Some(tick_sink()))

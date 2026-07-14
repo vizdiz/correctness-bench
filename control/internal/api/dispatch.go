@@ -27,6 +27,7 @@ type coordRunRequest struct {
 	MaxBodyBytes       *int32            `json:"max_body_bytes,omitempty"`
 	ContentType        *string           `json:"content_type,omitempty"`
 	TargetHeaders      map[string]string `json:"target_headers,omitempty"`
+	EpochUnixUS        int64             `json:"epoch_unix_us,omitempty"`
 	ControlTickURL     string            `json:"control_tick_url,omitempty"`
 	ControlFinalizeURL string            `json:"control_finalize_url,omitempty"`
 }
@@ -46,7 +47,10 @@ type assertFields struct {
 // blocks for the whole run (the coordinator holds the connection), so it is
 // ALWAYS called in its own goroutine. Target headers ride in memory only and
 // are never persisted or logged.
-func (s *Server) dispatchToCoordinator(runID string, req *CreateRunRequest) {
+// dispatchToCoordinator fires a run at the coordinator. epochUnixUs of 0 lets
+// the coordinator start the schedule now; a shared non-zero epoch makes two
+// runs share one window (fair concurrent comparison).
+func (s *Server) dispatchToCoordinator(runID string, req *CreateRunRequest, epochUnixUs int64) {
 	if err := s.Store.MarkRunning(context.Background(), runID); err != nil {
 		s.Log.Warn("mark running", "run_id", runID, "err", err.Error())
 	}
@@ -84,6 +88,7 @@ func (s *Server) dispatchToCoordinator(runID string, req *CreateRunRequest) {
 		MaxBodyBytes:       a.MaxBodyBytes,
 		ContentType:        a.ContentType,
 		TargetHeaders:      req.Target.Headers,
+		EpochUnixUS:        epochUnixUs,
 		ControlTickURL:     fmt.Sprintf("%s/v1/_internal/runs/%s/tick", self, runID),
 		ControlFinalizeURL: fmt.Sprintf("%s/v1/_internal/runs/%s/finalize", self, runID),
 	})

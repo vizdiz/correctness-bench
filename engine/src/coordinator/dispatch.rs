@@ -43,6 +43,10 @@ pub struct DispatchSpec {
     /// Request headers (auth / custom) carried to the target via
     /// bench.proto Target.headers. Never persisted or logged by anyone.
     pub target_headers: std::collections::HashMap<String, String>,
+    /// Shared fleet epoch (unix micros). 0 = generate one now. Non-zero lets
+    /// the control plane fire two runs against the SAME schedule window for a
+    /// fair concurrent comparison.
+    pub epoch_unix_us: i64,
 }
 
 /// A non-fatal warning surfaced from a dispatch. Serialized straight into the
@@ -206,10 +210,16 @@ pub async fn dispatch_with_ticks(
 
     let num_workers = workers.len();
     let per_worker_rps = spec.target_rps / num_workers as f64;
-    let epoch_unix_us = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
+    // A caller-supplied epoch (non-zero) lets two runs share ONE schedule window
+    // for a fair concurrent comparison; otherwise start now.
+    let epoch_unix_us = if spec.epoch_unix_us != 0 {
+        spec.epoch_unix_us
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    };
 
     // Register this run in the coordinator's in-flight registry so an
     // out-of-band `abort_run` can cancel it and fan Abort out to these workers.

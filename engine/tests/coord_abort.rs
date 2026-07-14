@@ -92,7 +92,7 @@ fn spec(run_id: &str, mock_addr: SocketAddr, duration_s: u64) -> DispatchSpec {
         min_body_bytes: None,
         max_body_bytes: None,
         content_type: None,
-        target_headers: Default::default(),
+        target_headers: Default::default(), epoch_unix_us: 0,
     }
 }
 

@@ -35,6 +35,8 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/{id}/compare/{id2}", s.Compare)
 			r.Post("/{id}/regression-check", s.RegressionCheck)
 		})
+		// Fair concurrent A/B: fire two runs against two targets under one epoch.
+		r.Post("/comparisons", s.CreateComparison)
 		r.Route("/_internal/runs/{id}", func(r chi.Router) {
 			r.Post("/tick", s.IngestTick)
 			r.Post("/finalize", s.FinalizeRun)

@@ -4,6 +4,7 @@ import { RunsList } from './pages/RunsList'
 import { RunNew } from './pages/RunNew'
 import { RunDetail } from './pages/RunDetail'
 import { Compare } from './pages/Compare'
+import { NewComparison } from './pages/NewComparison'
 import { Templates } from './pages/Templates'
 
 export default function App() {
@@ -14,6 +15,7 @@ export default function App() {
         <Route path="/runs" element={<RunsList />} />
         <Route path="/runs/new" element={<RunNew />} />
         <Route path="/runs/:id" element={<RunDetail />} />
+        <Route path="/compare/new" element={<NewComparison />} />
         <Route path="/compare/:idA/:idB" element={<Compare />} />
         <Route path="/templates" element={<Templates />} />
         <Route path="*" element={<Navigate to="/runs" replace />} />

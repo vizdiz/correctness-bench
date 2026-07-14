@@ -48,6 +48,10 @@ pub struct RunRequest {
     /// worker over bench.proto Target.headers. Never persisted or logged.
     #[serde(default)]
     pub target_headers: std::collections::HashMap<String, String>,
+    /// Shared fleet epoch (unix micros). 0/omitted = start now. Two runs given
+    /// the same non-zero epoch share one schedule window (concurrent compare).
+    #[serde(default)]
+    pub epoch_unix_us: i64,
     pub max_latency_us: Option<i64>,
     pub min_body_bytes: Option<i32>,
     pub max_body_bytes: Option<i32>,
@@ -188,6 +192,7 @@ async fn run_endpoint(
         max_body_bytes: req.max_body_bytes,
         content_type: req.content_type,
         target_headers: req.target_headers,
+        epoch_unix_us: req.epoch_unix_us,
     };
 
     // Live tick aggregator. Always runs; it tracks running totals so we can
