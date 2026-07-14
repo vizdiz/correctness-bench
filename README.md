@@ -116,14 +116,6 @@ Not in this build (out of Phase-1 scope): OpenTelemetry tracing, Jaeger/Grafana 
 | [`contracts/`](contracts/) | - | Frozen: `bench.proto`, `api.md`, `schema.sql`. |
 | [`gates/`](gates/)     | - | Acceptance gates, runners, result artifacts. |
 
-## Hard rules
-
-1. Workers never persist and never authenticate.
-2. The control plane never generates load.
-3. A slow DB write must never back-pressure the scheduler.
-4. Target API keys: in memory for the run only, never persisted or logged, scrubbed from exports. Canary-verified.
-5. Latency is measured from intended send time (gate #1's invariant).
-
 ## Reference
 
 - [`latency-bench-architecture.md`](latency-bench-architecture.md) - design doc.
