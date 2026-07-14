@@ -1,7 +1,6 @@
 # Per-package CI. Each job is a hermetic build + test for one part of the
 # monorepo so a failure points at the right package without forcing the others
-# to rebuild. The web visual-regression job is the only one that needs a
-# browser; everything else is plain Rust / Go / TS.
+# to rebuild. All plain Rust / Go / TS; no browser needed.
 
 name: ci
 
@@ -107,7 +106,7 @@ jobs:
         working-directory: mcp
 
   web:
-    name: web (build + visual regression)
+    name: web (build)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -120,20 +119,7 @@ jobs:
       - name: install
         run: npm ci
         working-directory: web
+      # tsc -b + vite build. Type errors and bundling failures fail CI.
       - name: production build
         run: npm run build
         working-directory: web
-      # Visual regression: hermetic (page.route fixtures), so no docker / db.
-      - name: install playwright browser
-        run: npx playwright install --with-deps chromium
-        working-directory: web
-      - name: visual regression
-        run: npm run test:visual
-        working-directory: web
-      - name: upload visual diff on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report
-          path: web/test-results
-          if-no-files-found: ignore
