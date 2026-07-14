@@ -75,5 +75,6 @@ intend to move the baseline.
 
 - A reachable control plane (self-hosted `docker-compose`, or the managed tier).
 - A published `bench` CLI release asset named `bench-x86_64-unknown-linux-gnu`
-  (Linux x86_64). Until releases are published, pin `bench-version` to a tag that
-  has the asset, or install the CLI in a prior step.
+  (Linux x86_64). Publish them by tagging a version -
+  `git tag v0.1.0 && git push --tags` - which runs `.github/workflows/release.yml`
+  to cross-build `bench` and attach the binaries to the release.
