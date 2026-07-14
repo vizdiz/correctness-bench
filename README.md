@@ -1,6 +1,6 @@
 # correctness-bench
 
-Measure API **correctness as a continuous function of load**, not just latency. Point it at any HTTP endpoint, declare what "correct" means (status, JSON schema, value, max latency), and get the RPS where responses start going wrong - which is often well before latency degrades.
+Load-test APIs for correctness, not just latency. Finds the request rate where an API starts returning wrong responses, often while latency still looks fine.
 
 ```
   Correctness vs offered RPS
