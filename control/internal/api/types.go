@@ -91,6 +91,7 @@ type RunView struct {
 	CostPerRequestUSD *float64           `json:"cost_per_request_usd,omitempty"`
 	StatusReason      string             `json:"status_reason,omitempty"`
 	Warnings          json.RawMessage    `json:"warnings,omitempty"`
+	RateLimitOnsetRPS *float64           `json:"rate_limit_onset_rps,omitempty"`
 }
 
 // RunSummary is a compact list-row.

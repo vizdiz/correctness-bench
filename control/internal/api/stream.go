@@ -219,6 +219,9 @@ type FinalizeRunRequest struct {
 	// Non-fatal warnings for the run, e.g. [{"code":"WORKER_LOST","message":...}].
 	// Persisted verbatim to runs.warnings.
 	Warnings json.RawMessage `json:"warnings,omitempty"`
+	// Offered RPS where the first 429 appeared (nil until one does). Persisted
+	// to runs.rate_limit_onset_rps.
+	RateLimitOnsetRPS *float64 `json:"rate_limit_onset_rps,omitempty"`
 }
 
 // FinalizeRun: POST /v1/_internal/runs/{id}/finalize. Internal-only endpoint
@@ -279,6 +282,7 @@ func (s *Server) FinalizeRun(w http.ResponseWriter, r *http.Request) {
 		CorrectedHistBytes:   histBytes,
 		UncorrectedHistBytes: uncorrectedBytes,
 		WarningsJSON:         string(req.Warnings),
+		RateLimitOnsetRPS:    req.RateLimitOnsetRPS,
 	}); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")
