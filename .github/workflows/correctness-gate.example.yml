@@ -1,0 +1,35 @@
+# Example: gate a pull request on correctness-under-load.
+#
+# Copy this into a consumer repo's .github/workflows/. It benchmarks a target
+# API and fails the PR if correctness or p99 latency regresses past a threshold
+# versus a recorded baseline run.
+#
+# Prerequisites:
+#   - A reachable correctness-bench control plane (self-hosted or managed).
+#   - Repo secrets:  BENCH_CONTROL_URL, TARGET_API_KEY
+#   - Repo variable: BENCH_BASELINE_RUN_ID  (a finalized run id from main; see below)
+#
+# Establishing / updating the baseline: run the same benchmark against main,
+# take the printed run id, and store it as the BENCH_BASELINE_RUN_ID variable.
+name: correctness-gate.example
+on:
+  pull_request:
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Correctness-under-load gate
+        uses: vizdiz/correctness-bench/.github/actions/correctness-gate@main
+        with:
+          control-url: ${{ secrets.BENCH_CONTROL_URL }}
+          target-url: https://staging.example.com/api/checkout
+          rps: '1000'
+          duration: '60'
+          expected-status: '200'
+          max-latency-ms: '200'
+          api-key: ${{ secrets.TARGET_API_KEY }}
+          baseline-run-id: ${{ vars.BENCH_BASELINE_RUN_ID }}
+          p99-delta-pct: '10'
+          correctness-delta-pct: '1'
+          bench-version: latest

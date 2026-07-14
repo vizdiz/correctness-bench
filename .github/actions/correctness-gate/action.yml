@@ -1,0 +1,180 @@
+name: 'Correctness Under Load Gate'
+description: >-
+  Benchmark an API under load and fail the build when correctness or p99 latency
+  regresses past a threshold versus a baseline run. A fast HTTP 500 is a failure,
+  not a pass.
+author: 'correctness-bench'
+branding:
+  icon: 'trending-down'
+  color: 'green'
+
+inputs:
+  control-url:
+    description: 'Base URL of your correctness-bench control plane (e.g. https://bench.internal:8000).'
+    required: true
+  target-url:
+    description: 'The API URL to benchmark.'
+    required: true
+  method:
+    description: 'HTTP method.'
+    required: false
+    default: 'GET'
+  rps:
+    description: 'Target requests per second.'
+    required: false
+    default: '100'
+  duration:
+    description: 'Run duration in seconds.'
+    required: false
+    default: '30'
+  connections:
+    description: 'Open connections (pool size).'
+    required: false
+    default: '50'
+  expected-status:
+    description: 'Space-separated expected HTTP status codes (empty = any 2xx).'
+    required: false
+    default: '200'
+  max-latency-ms:
+    description: 'Optional inline max-latency assertion (ms). A slower response counts as a correctness failure.'
+    required: false
+    default: ''
+  name:
+    description: 'Run name shown in the dashboard. Defaults to ci-<short-sha>.'
+    required: false
+    default: ''
+  api-key:
+    description: 'API key for the target, sent as a Bearer token. Pass a secret; it is never persisted by control.'
+    required: false
+    default: ''
+  baseline-run-id:
+    description: 'A finalized baseline run id to gate against. Omit to benchmark without gating (record-only).'
+    required: false
+    default: ''
+  p99-delta-pct:
+    description: 'Max allowed p99 latency regression vs baseline, in percent.'
+    required: false
+    default: '10'
+  correctness-delta-pct:
+    description: 'Max allowed correctness drop vs baseline, in absolute percentage points.'
+    required: false
+    default: '1'
+  web-url:
+    description: 'Base URL of the web dashboard, for the run link. Defaults to control-url.'
+    required: false
+    default: ''
+  bench-version:
+    description: 'Release tag of the bench CLI to download (asset bench-x86_64-unknown-linux-gnu).'
+    required: false
+    default: 'latest'
+
+outputs:
+  run-id:
+    description: 'The id of the run this gate created.'
+    value: ${{ steps.run.outputs.run-id }}
+  dashboard-url:
+    description: 'Deep link to the run in the dashboard.'
+    value: ${{ steps.run.outputs.dashboard-url }}
+  passed:
+    description: '"true" if the run completed and the regression gate (if any) passed.'
+    value: ${{ steps.gate.outputs.passed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install bench CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        ver="${{ inputs.bench-version }}"
+        repo="vizdiz/correctness-bench"
+        if [ "$ver" = "latest" ]; then
+          url="https://github.com/$repo/releases/latest/download/bench-x86_64-unknown-linux-gnu"
+        else
+          url="https://github.com/$repo/releases/download/$ver/bench-x86_64-unknown-linux-gnu"
+        fi
+        echo "Downloading bench CLI from $url"
+        curl -fsSL "$url" -o /usr/local/bin/bench
+        chmod +x /usr/local/bin/bench
+        bench --help >/dev/null
+
+    - name: Run benchmark
+      id: run
+      shell: bash
+      env:
+        BENCH_CONTROL_URL: ${{ inputs.control-url }}
+        BENCH_WEB_URL: ${{ inputs.web-url != '' && inputs.web-url || inputs.control-url }}
+        BENCH_API_KEY: ${{ inputs.api-key }}
+      run: |
+        set -euo pipefail
+        name="${{ inputs.name }}"
+        [ -z "$name" ] && name="ci-${GITHUB_SHA::7}"
+
+        # Expand space-separated expected-status into repeated flags.
+        status_args=()
+        for s in ${{ inputs.expected-status }}; do status_args+=(--expected-status "$s"); done
+        extra=()
+        [ -n "${{ inputs.max-latency-ms }}" ] && extra+=(--max-latency-ms "${{ inputs.max-latency-ms }}")
+
+        out="$(bench run \
+          -t "${{ inputs.target-url }}" \
+          -m "${{ inputs.method }}" \
+          -R "${{ inputs.rps }}" \
+          -d "${{ inputs.duration }}" \
+          -c "${{ inputs.connections }}" \
+          -n "$name" \
+          "${status_args[@]}" "${extra[@]}" 2>&1)" || {
+            echo "$out"; echo "::error::benchmark run failed to complete"; exit 1;
+          }
+        echo "$out"
+
+        run_id="$(printf '%s\n' "$out" | grep -oE 'created run [0-9a-f-]{36}' | head -1 | awk '{print $3}')"
+        if [ -z "$run_id" ]; then echo "::error::could not parse run id from bench output"; exit 1; fi
+        web="${{ inputs.web-url != '' && inputs.web-url || inputs.control-url }}"
+        echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+        echo "dashboard-url=${web%/}/runs/$run_id" >> "$GITHUB_OUTPUT"
+
+    - name: Regression gate
+      id: gate
+      shell: bash
+      env:
+        BENCH_CONTROL_URL: ${{ inputs.control-url }}
+      run: |
+        set -uo pipefail
+        run_id="${{ steps.run.outputs.run-id }}"
+        baseline="${{ inputs.baseline-run-id }}"
+        {
+          echo "### Correctness-under-load gate"
+          echo ""
+          echo "- Run: [\`$run_id\`](${{ steps.run.outputs.dashboard-url }})"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ -z "$baseline" ]; then
+          echo "- Mode: record-only (no baseline-run-id given), gate skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        gate_out="$(bench regression "$run_id" \
+          --baseline "$baseline" \
+          --p99-delta-pct "${{ inputs.p99-delta-pct }}" \
+          --correctness-delta-pct "${{ inputs.correctness-delta-pct }}" 2>&1)"
+        rc=$?
+        echo "$gate_out"
+        {
+          echo "- Baseline: \`$baseline\`"
+          echo ""
+          echo '```'
+          echo "$gate_out"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ $rc -eq 0 ]; then
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "- **Result: PASS**" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          echo "- **Result: FAIL (regression past threshold)**" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::correctness/p99 regressed past the threshold"
+          exit 1
+        fi
