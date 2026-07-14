@@ -89,6 +89,8 @@ type RunView struct {
 	Offload           *OffloadCountsView `json:"offload,omitempty"`
 	Final             *FinalsView        `json:"final,omitempty"`
 	CostPerRequestUSD *float64           `json:"cost_per_request_usd,omitempty"`
+	StatusReason      string             `json:"status_reason,omitempty"`
+	Warnings          json.RawMessage    `json:"warnings,omitempty"`
 }
 
 // RunSummary is a compact list-row.

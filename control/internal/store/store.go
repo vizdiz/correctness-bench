@@ -84,6 +84,8 @@ type RunRow struct {
 	TotalPass       *int64
 	CliffRPS        *float64
 	CostPerReqUSD   *float64
+	StatusReason    *string
+	Warnings        []byte
 }
 
 // InsertRun inserts a queued run and returns its id + created_at.
@@ -117,14 +119,14 @@ func (s *Store) GetRun(ctx context.Context, id string) (*RunRow, error) {
 SELECT id, name, status, target_url, target_method, target_rps, duration_s,
        effective_rps, created_at, started_at, completed_at,
        p50_us, p95_us, p99_us, p999_us,
-       total_requests, total_pass, cliff_rps, cost_per_request_usd
+       total_requests, total_pass, cliff_rps, cost_per_request_usd, status_reason, warnings
 FROM runs WHERE id = $1`
 	var r RunRow
 	err := s.pool.QueryRow(ctx, q, id).Scan(
 		&r.ID, &r.Name, &r.Status, &r.TargetURL, &r.TargetMethod, &r.TargetRPS, &r.DurationS,
 		&r.EffectiveRPS, &r.CreatedAt, &r.StartedAt, &r.CompletedAt,
 		&r.P50US, &r.P95US, &r.P99US, &r.P999US,
-		&r.TotalRequests, &r.TotalPass, &r.CliffRPS, &r.CostPerReqUSD,
+		&r.TotalRequests, &r.TotalPass, &r.CliffRPS, &r.CostPerReqUSD, &r.StatusReason, &r.Warnings,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -256,6 +258,9 @@ type FinalizeRunParams struct {
 	// UncorrectedHistBytes is the V2-deflate HDR snapshot persisted to
 	// runs.final_uncorrected_hist; same COALESCE semantics as corrected.
 	UncorrectedHistBytes []byte
+	// WarningsJSON is a JSON array of {code,message} (e.g. WORKER_LOST) persisted
+	// to runs.warnings. "" leaves the column untouched.
+	WarningsJSON string
 }
 
 // FinalizeRun writes the run's finals + transitions to `Status`. Idempotent in
@@ -274,12 +279,13 @@ SET effective_rps = $2,
     status = $10, status_reason = NULLIF($11, ''),
     final_corrected_hist = COALESCE($12, final_corrected_hist),
     final_uncorrected_hist = COALESCE($13, final_uncorrected_hist),
+    warnings = COALESCE(NULLIF($14, '')::jsonb, warnings),
     completed_at = COALESCE(completed_at, now())
 WHERE id = $1`
 	tag, err := s.pool.Exec(ctx, q, id,
 		p.EffectiveRPS, p.P50US, p.P95US, p.P99US, p.P999US,
 		p.TotalRequests, p.TotalPass, p.CliffRPS, p.Status, p.StatusReason,
-		p.CorrectedHistBytes, p.UncorrectedHistBytes,
+		p.CorrectedHistBytes, p.UncorrectedHistBytes, p.WarningsJSON,
 	)
 	if err != nil {
 		return err

@@ -16,7 +16,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use super::dispatch::{dispatch_with_ticks, AggregatedTick, DispatchError, DispatchSpec, DispatchSummary};
+use super::dispatch::{
+    dispatch_with_ticks, AggregatedTick, DispatchError, DispatchSpec, DispatchSummary, Warning,
+};
 use super::{CoordinatorState, Worker};
 
 #[derive(Clone)]
@@ -80,6 +82,11 @@ pub struct RunResponse {
     pub total_rate_limited: u64,
     /// Offered RPS at which the fleet first saw a 429. `null` if never limited.
     pub rate_limit_onset_rps: Option<f64>,
+    /// Workers that died mid-run (stream ended without a final Partial). 0 on a
+    /// clean run. Distinct from an abort.
+    pub workers_lost: usize,
+    /// Non-fatal warnings (e.g. WORKER_LOST). Empty array on a clean run.
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,8 +244,26 @@ async fn run_endpoint(
                 } else {
                     enc.encode(&finals_snapshot.last_uncorrected_hist_v2)
                 };
+                // Honestly reduce effective_rps when workers were lost mid-run.
+                // The last aggregated tick reflects the FULL fleet (ticks stall
+                // once a worker stops reporting), so scale it down by the
+                // survivor fraction rather than fabricating the dead worker's
+                // load. On a clean run this is a no-op.
+                let effective_rps = if summary.workers_lost > 0 && summary.workers_dispatched > 0 {
+                    finals_snapshot.last_achieved_rps
+                        * (summary.workers_finished as f64 / summary.workers_dispatched as f64)
+                } else {
+                    finals_snapshot.last_achieved_rps
+                };
+                // Warnings array (empty when none). Field name is exactly
+                // "warnings" so control persists it to runs.warnings.
+                let warnings: Vec<serde_json::Value> = summary
+                    .warnings
+                    .iter()
+                    .map(|w| serde_json::json!({ "code": w.code, "message": w.message }))
+                    .collect();
                 let body = serde_json::json!({
-                    "effective_rps":  finals_snapshot.last_achieved_rps,
+                    "effective_rps":  effective_rps,
                     "p50_us":  finals_snapshot.last_p50_us as i64,
                     "p95_us":  finals_snapshot.last_p95_us as i64,
                     "p99_us":  finals_snapshot.last_p99_us as i64,
@@ -251,6 +276,8 @@ async fn run_endpoint(
                     "uncorrected_hist_b64": uncorrected_b64,
                     "rate_limited": summary.total_rate_limited as i64,
                     "rate_limit_onset_rps": summary.first_429_rps,
+                    "workers_lost": summary.workers_lost as i64,
+                    "warnings": warnings,
                 });
                 let http = reqwest::Client::new();
                 let req = http.post(url).json(&body);
@@ -336,5 +363,7 @@ fn to_response(run_id: String, s: DispatchSummary) -> RunResponse {
         total_fail_content_type: s.total_fail_content_type,
         total_rate_limited: s.total_rate_limited,
         rate_limit_onset_rps: s.first_429_rps,
+        workers_lost: s.workers_lost,
+        warnings: s.warnings,
     }
 }

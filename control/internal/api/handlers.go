@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -33,6 +34,9 @@ type Server struct {
 	SelfURL        string
 	// dispatch client with no timeout — /admin/runs blocks for the run duration.
 	dispatchClient *http.Client
+	// costGuard caches per-run cost-ceiling state (run_id -> *costState) so the
+	// in-flight budget check doesn't hit the DB every tick.
+	costGuard sync.Map
 }
 
 func NewServer(s *store.Store, log *slog.Logger, coordinatorURL, selfURL string) *Server {
@@ -324,6 +328,10 @@ func runViewFrom(row *store.RunRow) RunView {
 		EffectiveRPS:      row.EffectiveRPS,
 		CreatedAt:         row.CreatedAt.UTC().Format(time.RFC3339),
 		CostPerRequestUSD: row.CostPerReqUSD,
+		StatusReason:      derefStr(row.StatusReason),
+	}
+	if len(row.Warnings) > 0 {
+		v.Warnings = row.Warnings
 	}
 	if row.StartedAt != nil {
 		s := row.StartedAt.UTC().Format(time.RFC3339)
