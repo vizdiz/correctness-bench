@@ -96,7 +96,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
       className="overflow-visible"
     >
       {/* Horizontal gridlines on pass-rate axis (0/25/50/75/100). */}
-      {[0, 0.5, 1].map((r, i, arr) => (
+      {[0, 0.5, 1].map((r) => (
         <g key={r}>
           <line
             x1={PAD.left}
