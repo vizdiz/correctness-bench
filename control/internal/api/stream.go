@@ -41,6 +41,10 @@ func (s *Server) IngestTick(w http.ResponseWriter, r *http.Request) {
 	// fan-out (schema hard rule #4).
 	go s.persistTick(id, tick)
 
+	// Enforce the in-flight cost ceiling (auto-abort a runaway metered run).
+	// Async for the same reason.
+	go s.checkCost(id, tick.CompletedTotal)
+
 	// Offload eval: evaluate every sampled body against this run's spec.
 	// Async so the ingest path isn't blocked on the DB write; spawning N
 	// goroutines per tick is fine - sample_every_n caps N in practice.
@@ -212,6 +216,9 @@ type FinalizeRunRequest struct {
 	// Base64-encoded V2-deflate uncorrected HDR histogram. Persisted to
 	// runs.final_uncorrected_hist; (corrected - uncorrected) is the COO delta.
 	UncorrectedHistB64 string `json:"uncorrected_hist_b64,omitempty"`
+	// Non-fatal warnings for the run, e.g. [{"code":"WORKER_LOST","message":...}].
+	// Persisted verbatim to runs.warnings.
+	Warnings json.RawMessage `json:"warnings,omitempty"`
 }
 
 // FinalizeRun: POST /v1/_internal/runs/{id}/finalize. Internal-only endpoint
@@ -271,6 +278,7 @@ func (s *Server) FinalizeRun(w http.ResponseWriter, r *http.Request) {
 		StatusReason:         req.StatusReason,
 		CorrectedHistBytes:   histBytes,
 		UncorrectedHistBytes: uncorrectedBytes,
+		WarningsJSON:         string(req.Warnings),
 	}); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, CodeNotFound, "run not found", "")

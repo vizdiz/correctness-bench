@@ -45,13 +45,31 @@ pub struct DispatchSpec {
     pub target_headers: std::collections::HashMap<String, String>,
 }
 
+/// A non-fatal warning surfaced from a dispatch. Serialized straight into the
+/// finalize push's `"warnings"` array so the control plane can persist it to
+/// `runs.warnings`. `code` is a stable machine token (e.g. "WORKER_LOST");
+/// `message` is human-readable.
+#[derive(Debug, Clone, Serialize)]
+pub struct Warning {
+    pub code: String,
+    pub message: String,
+}
+
 /// Result of a `dispatch` call. Counts are summed across every worker that
 /// participated. `workers_finished` is the count whose stream concluded with
-/// a `final = true` Partial (others may have errored mid-run).
+/// a `final = true` Partial (others may have errored / died mid-run).
 #[derive(Default, Debug)]
 pub struct DispatchSummary {
     pub workers_dispatched: usize,
     pub workers_finished: usize,
+    /// Workers whose RunSlice stream ended WITHOUT a final Partial(final=true) —
+    /// i.e. they errored or died mid-run. Their partial load is NOT fabricated;
+    /// the totals/effective RPS reflect only what the survivors actually sent.
+    /// Distinct from an abort (an abort finishes every worker cleanly).
+    pub workers_lost: usize,
+    /// Non-fatal warnings (e.g. WORKER_LOST). Empty on a clean run. Surfaced in
+    /// the finalize push's `"warnings"` array.
+    pub warnings: Vec<Warning>,
     pub total_completed: u64,
     pub total_pass: u64,
     pub total_fail_status: u64,
@@ -255,6 +273,39 @@ pub async fn dispatch_with_ticks(
         }
     }
     summary.aborted = cancel.is_cancelled();
+    // A worker that never emitted a final Partial(final=true) died / errored
+    // mid-run. An abort finishes every worker cleanly (they drain + send final),
+    // so we only treat unfinished workers as "lost" when the run was NOT aborted.
+    if !summary.aborted {
+        summary.workers_lost = summary
+            .workers_dispatched
+            .saturating_sub(summary.workers_finished);
+        if summary.workers_lost > 0 {
+            // Honest accounting: each lost worker was carrying ~per_worker_rps of
+            // the target. We do NOT redistribute it to survivors, so that RPS is
+            // simply unmet.
+            let unmet_rps = per_worker_rps * summary.workers_lost as f64;
+            let msg = format!(
+                "ran {} of {} workers; ~{:.0} rps of {:.0} unmet",
+                summary.workers_finished,
+                summary.workers_dispatched,
+                unmet_rps,
+                spec.target_rps,
+            );
+            tracing::warn!(
+                run_id = %spec.run_id,
+                workers_lost = summary.workers_lost,
+                workers_finished = summary.workers_finished,
+                workers_dispatched = summary.workers_dispatched,
+                unmet_rps,
+                "dispatch: worker(s) lost mid-run; run continued with survivors"
+            );
+            summary.warnings.push(Warning {
+                code: "WORKER_LOST".to_string(),
+                message: msg,
+            });
+        }
+    }
     state.deregister_run(&spec.run_id);
     Ok(summary)
 }

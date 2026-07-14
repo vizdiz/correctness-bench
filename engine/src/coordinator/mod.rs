@@ -42,6 +42,13 @@ pub struct Worker {
 /// own version; mismatch fails the handshake with a clear reason.
 pub const CONTRACT_VERSION: &str = "1.0.0";
 
+/// How often the heartbeat reaper scans the registry.
+pub const REAPER_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A worker is considered dead after this long without a heartbeat. Per
+/// bench.proto: workers push every 1s; 3 consecutive misses → dead.
+pub const HEARTBEAT_DEAD_AFTER: Duration = Duration::from_secs(3);
+
 /// A run currently being dispatched by this coordinator. Held in the in-flight
 /// registry so an out-of-band `abort_run` can (a) stop the local aggregation
 /// loop and (b) fan an `Abort` gRPC out to every participating worker.
@@ -69,6 +76,33 @@ impl CoordinatorState {
 
     pub async fn list_workers(&self) -> Vec<Worker> {
         self.workers.read().await.values().cloned().collect()
+    }
+
+    /// Evict every worker whose `last_heartbeat` is older than `dead_after`.
+    /// Returns the evicted `worker_id`s. Keeping the registry accurate means
+    /// future dispatches skip dead workers (this does NOT touch in-flight runs —
+    /// mid-run loss is handled separately in dispatch via the RunSlice stream
+    /// ending without a final Partial). One scan; the reaper loop drives it.
+    pub async fn reap_dead_workers(&self, dead_after: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let mut guard = self.workers.write().await;
+        let dead: Vec<String> = guard
+            .iter()
+            .filter(|(_, w)| now.duration_since(w.last_heartbeat) > dead_after)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dead {
+            guard.remove(id);
+        }
+        drop(guard);
+        for id in &dead {
+            eprintln!(
+                "coordinator: evicting dead worker {id} (no heartbeat for >{:?})",
+                dead_after,
+            );
+            tracing::warn!(worker_id = %id, dead_after_s = dead_after.as_secs(), "heartbeat reaper: evicted dead worker");
+        }
+        dead
     }
 
     /// Register an in-flight run so it can be aborted. Called at the top of
@@ -255,11 +289,30 @@ impl Bench for CoordinatorService {
     }
 }
 
+/// Spawn the background heartbeat reaper: every [`REAPER_SCAN_INTERVAL`] it
+/// scans the registry and deregisters any worker that has missed heartbeats for
+/// longer than [`HEARTBEAT_DEAD_AFTER`]. Runs until the returned handle (or the
+/// process) is dropped. Idempotent to spawn once per coordinator.
+pub fn spawn_heartbeat_reaper(state: Arc<CoordinatorState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REAPER_SCAN_INTERVAL);
+        // Skip the immediate first tick so a just-registered fleet isn't scanned
+        // before anyone has had a chance to heartbeat.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = state.reap_dead_workers(HEARTBEAT_DEAD_AFTER).await;
+        }
+    })
+}
+
 /// Bind a tonic server with the coordinator's Bench impl on `addr`. Future
 /// resolves only when the server stops (signal, error, etc.). Returns the
-/// shared state so the caller can introspect (CLI / tests).
+/// shared state so the caller can introspect (CLI / tests). Also starts the
+/// background heartbeat reaper.
 pub async fn serve(addr: SocketAddr) -> Result<Arc<CoordinatorState>, Box<dyn std::error::Error>> {
     let state = Arc::new(CoordinatorState::new());
+    let _reaper = spawn_heartbeat_reaper(state.clone());
     let svc = CoordinatorService::new(state.clone());
     eprintln!("coordinator: listening on {}", addr);
     tonic::transport::Server::builder()

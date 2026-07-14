@@ -46,6 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(CoordinatorState::new());
 
+    // Background heartbeat reaper: evicts workers that stop heartbeating so the
+    // registry stays accurate and future dispatches skip dead workers.
+    let _reaper = engine::coordinator::spawn_heartbeat_reaper(state.clone());
+
     // Spawn the gRPC server in the background.
     let grpc_state = state.clone();
     let grpc_addr = cli.grpc_addr;
