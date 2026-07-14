@@ -138,7 +138,7 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	status := "queued"
 	if s.CoordinatorURL != "" {
 		reqCopy := req
-		go s.dispatchToCoordinator(id, &reqCopy)
+		go s.dispatchToCoordinator(id, &reqCopy, 0)
 		status = "running"
 	}
 

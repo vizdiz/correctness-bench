@@ -196,6 +196,23 @@ export const api = {
   compare: (idA: string, idB: string) =>
     req<CompareResponse>(`/v1/runs/${idA}/compare/${idB}`),
 
+  // Fire two targets against one shared schedule (fair concurrent A/B).
+  createComparison: (body: {
+    name?: string
+    target_a: { url: string; method?: string }
+    target_b: { url: string; method?: string }
+    target_rps: number
+    duration_s: number
+    connections?: number
+    keepalive?: boolean
+    load_model?: string
+    assert?: { expected_status?: number[] }
+  }) =>
+    req<{ comparison_id: string; run_a: string; run_b: string }>('/v1/comparisons', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   regressionCheck: (
     candidateID: string,
     baselineID: string,

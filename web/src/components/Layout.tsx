@@ -43,6 +43,7 @@ export function Layout({ children }: { children: ReactNode }) {
         <nav className="flex flex-col gap-0.5">
           <NavItem to="/runs" label="Runs" end />
           <NavItem to="/runs/new" label="New run" />
+          <NavItem to="/compare/new" label="Compare APIs" />
           <NavItem to="/templates" label="Templates" />
         </nav>
         <div className="mt-auto px-2">
