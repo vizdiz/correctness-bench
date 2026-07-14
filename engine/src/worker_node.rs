@@ -11,13 +11,15 @@
 //! Histogram serialization is deferred — the V2/HDR bytes fields stay empty
 //! for the first cut (counts + buckets merge fine without them).
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::Stream;
 use http::Uri;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::bench::bench_server::Bench;
@@ -26,15 +28,24 @@ use crate::proto::bench::{
     AbortAck, AbortRequest, Assignment, HealthAck, HttpMethod, Partial, RateLimit, RateLimitAction,
     RegisterAck, RpsBucket, Started, WorkerEvent, WorkerHealth, WorkerInfo,
 };
-use crate::worker::{run_with_ticks, RlAction, RunSpec, Tick};
+use crate::worker::{run_with_ticks_cancel, RlAction, RunSpec, Tick};
 
 pub struct WorkerNodeService {
     pub worker_id: String,
+    /// In-flight runs on this worker, keyed by `run_id`. Each holds a
+    /// [`CancellationToken`] that `Abort` fires to stop the run mid-flight.
+    /// Inserted at the top of `RunSlice`, removed when the slice ends (whether
+    /// it completed naturally or was aborted). A `std::sync::Mutex` is fine here
+    /// — every critical section is a single map op with no `.await` held.
+    run_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
 impl WorkerNodeService {
     pub fn new(worker_id: String) -> Self {
-        Self { worker_id }
+        Self {
+            worker_id,
+            run_tokens: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -75,6 +86,16 @@ impl Bench for WorkerNodeService {
         }
         let spec = build_run_spec(&a).map_err(|e| Status::invalid_argument(e.to_string()))?;
         let worker_id = self.worker_id.clone();
+        let run_id = a.run_id.clone();
+
+        // Register a cancellation token for this run so `Abort` can stop it
+        // mid-flight. Keyed by run_id; removed when the slice winds down.
+        let token = CancellationToken::new();
+        {
+            let mut map = self.run_tokens.lock().unwrap();
+            map.insert(run_id.clone(), token.clone());
+        }
+        let run_tokens = self.run_tokens.clone();
 
         // Snapshot the start time at the moment we accept the Assignment.
         let actual_start_unix_us = SystemTime::now()
@@ -86,9 +107,12 @@ impl Bench for WorkerNodeService {
         // Tick channel — engine::run_with_ticks emits per-second snapshots.
         let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<Tick>();
 
-        // Run the actual workload in a background task. We yield events on
-        // the outbound stream as the channel produces ticks.
-        let engine_handle = tokio::spawn(async move { run_with_ticks(spec, Some(tick_tx)).await });
+        // Run the actual workload in a background task, threading the cancel
+        // token so an Abort drains it. We yield events on the outbound stream
+        // as the channel produces ticks.
+        let engine_token = token.clone();
+        let engine_handle =
+            tokio::spawn(async move { run_with_ticks_cancel(spec, Some(tick_tx), Some(engine_token)).await });
 
         let outbound = async_stream::try_stream! {
             yield WorkerEvent {
@@ -108,8 +132,10 @@ impl Bench for WorkerNodeService {
                 };
             }
 
-            // Engine done; close out with a final Partial.
+            // Engine done (completed or aborted-and-drained); close out with a
+            // final Partial and deregister the run's cancel token.
             let _ = engine_handle.await;
+            run_tokens.lock().unwrap().remove(&run_id);
             yield WorkerEvent {
                 kind: Some(WorkerEventKind::Partial(empty_final_partial(&worker_id, tick_n + 1))),
             };
@@ -118,9 +144,34 @@ impl Bench for WorkerNodeService {
         Ok(Response::new(Box::pin(outbound)))
     }
 
-    async fn abort(&self, _: Request<AbortRequest>) -> Result<Response<AbortAck>, Status> {
-        // Mid-run abort is deferred — accept the ack so coordinator logic
-        // doesn't trip over it.
+    #[tracing::instrument(
+        name = "worker_node.abort",
+        level = "info",
+        skip(self, req),
+        fields(run_id = tracing::field::Empty, worker_id = tracing::field::Empty),
+    )]
+    async fn abort(&self, req: Request<AbortRequest>) -> Result<Response<AbortAck>, Status> {
+        let r = req.into_inner();
+        {
+            let span = tracing::Span::current();
+            span.record("run_id", &r.run_id.as_str());
+            span.record("worker_id", &self.worker_id.as_str());
+        }
+        // Look up the run's token and cancel it. The engine's run loop observes
+        // the cancel within one scheduling interval, drains in-flight responses,
+        // and returns; the RunSlice stream then emits its final Partial. We ack
+        // even when the run is unknown (already finished / never started) so the
+        // coordinator's best-effort fan-out never trips over a late abort.
+        let token = self.run_tokens.lock().unwrap().get(&r.run_id).cloned();
+        match token {
+            Some(t) => {
+                t.cancel();
+                tracing::info!(run_id = %r.run_id, reason = %r.reason, "abort: cancelled in-flight run");
+            }
+            None => {
+                tracing::info!(run_id = %r.run_id, "abort: run not in-flight (already finished?)");
+            }
+        }
         Ok(Response::new(AbortAck { accepted: true }))
     }
 }

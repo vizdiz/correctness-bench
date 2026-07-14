@@ -236,6 +236,10 @@ func (s *Server) AbortRun(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, "abort run", err)
 		return
 	}
+	// Propagate the stop to the fleet so workers drain and quit (<1s). The DB
+	// status is already aborted above; this is best-effort fleet teardown.
+	s.abortOnCoordinator(id)
+
 	s.Log.Info("run aborted", "run_id", id)
 	writeJSON(w, http.StatusOK, AbortResponse{
 		Status:    "aborted",

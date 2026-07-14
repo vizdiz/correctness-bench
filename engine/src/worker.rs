@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use http::{Method, Uri};
+use tokio_util::sync::CancellationToken;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -487,6 +488,27 @@ pub async fn run_with_ticks(
     spec: RunSpec,
     tick_tx: Option<mpsc::UnboundedSender<Tick>>,
 ) -> anyhow::Result<RunReport> {
+    run_with_ticks_cancel(spec, tick_tx, None).await
+}
+
+/// Like [`run_with_ticks`], but cancellable mid-run. When `cancel` fires the
+/// scheduler stops handing out new sends; each connection task drains the
+/// response it already has in flight (bounded by the per-request timeout) and
+/// exits. The returned [`RunReport`] reflects only requests that COMPLETED, so
+/// corrected/uncorrected histograms and latency semantics are unchanged for
+/// the requests that landed. The caller (worker_node) then emits its final
+/// `Partial { final = true }`.
+///
+/// Cancellation is bridged onto the existing run-wide `abort` atomic that every
+/// connection task already checks at the top of its loop (the same mechanism
+/// RL_ABORT uses). This keeps the hot send/read path untouched — the token adds
+/// zero per-request work — while still stopping the fleet within one scheduling
+/// interval plus one in-flight drain.
+pub async fn run_with_ticks_cancel(
+    spec: RunSpec,
+    tick_tx: Option<mpsc::UnboundedSender<Tick>>,
+    cancel: Option<CancellationToken>,
+) -> anyhow::Result<RunReport> {
     let host = spec
         .url
         .host()
@@ -576,6 +598,19 @@ pub async fn run_with_ticks(
             .await
         });
     }
+
+    // Bridge external cancellation onto the run-wide abort atomic. A tiny task
+    // waits for the token; on cancel it flips `counters.abort`, which every
+    // connection task observes at the top of its loop and breaks out of after
+    // draining whatever it has in flight. The task also exits on its own once
+    // the run completes (we abort the handle after the joinset drains).
+    let cancel_bridge = cancel.map(|token| {
+        let counters = counters.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            counters.abort.store(true, Ordering::Relaxed);
+        })
+    });
 
     barrier.wait().await;
     let worker_start = Instant::now();
@@ -715,6 +750,9 @@ pub async fn run_with_ticks(
     }
 
     if let Some(h) = tick_handle {
+        h.abort();
+    }
+    if let Some(h) = cancel_bridge {
         h.abort();
     }
 

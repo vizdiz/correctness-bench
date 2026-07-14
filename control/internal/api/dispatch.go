@@ -122,3 +122,26 @@ func (s *Server) dispatchFailed(runID, reason string) {
 		s.Log.Warn("mark failed", "run_id", runID, "err", err.Error())
 	}
 }
+
+// abortOnCoordinator asks the coordinator to stop the in-flight fleet for a run.
+// Best-effort and bounded: the control-plane DB status is already authoritative;
+// this propagates the stop to the workers (<1s). No-op if dispatch is disabled.
+func (s *Server) abortOnCoordinator(runID string) {
+	if s.CoordinatorURL == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	url := strings.TrimRight(s.CoordinatorURL, "/") + "/admin/runs/" + runID + "/abort"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		s.Log.Warn("abort build", "run_id", runID, "err", err.Error())
+		return
+	}
+	resp, err := s.dispatchClient.Do(req)
+	if err != nil {
+		s.Log.Warn("coordinator abort unreachable", "run_id", runID, "err", err.Error())
+		return
+	}
+	_ = resp.Body.Close()
+}

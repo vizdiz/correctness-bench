@@ -13,6 +13,7 @@ pub mod worker_node;
 pub use hist::{Histos, Summary};
 pub use sched::{ConnSched, RateSchedule};
 pub use worker::{
-    run, run_with_ticks, Bucket, PercentilesSoFar, RlAction, RunReport, RunSpec, SampledResponse,
+    run, run_with_ticks, run_with_ticks_cancel, Bucket, PercentilesSoFar, RlAction, RunReport,
+    RunSpec, SampledResponse,
     ThisTick, Tick,
 };

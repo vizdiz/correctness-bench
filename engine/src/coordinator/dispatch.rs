@@ -13,7 +13,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tonic::transport::Endpoint;
 
-use crate::coordinator::{CoordinatorState, CONTRACT_VERSION};
+use tokio_util::sync::CancellationToken;
+
+use crate::coordinator::{CoordinatorState, RunHandle, CONTRACT_VERSION};
 use crate::proto::bench::bench_client::BenchClient;
 use crate::proto::bench::worker_event::Kind as WorkerEventKind;
 use crate::proto::bench::{
@@ -62,6 +64,9 @@ pub struct DispatchSummary {
     /// Minimum non-null onset across workers: the lowest offered-RPS-at-send at
     /// which any worker first saw a 429. `None` if no worker was rate limited.
     pub first_429_rps: Option<f64>,
+    /// True if the run was aborted mid-flight (the dispatch cancel token fired).
+    /// Drives the finalize `status` field: "aborted" vs "completed".
+    pub aborted: bool,
 }
 
 #[derive(Debug)]
@@ -188,6 +193,17 @@ pub async fn dispatch_with_ticks(
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
 
+    // Register this run in the coordinator's in-flight registry so an
+    // out-of-band `abort_run` can cancel it and fan Abort out to these workers.
+    let cancel = CancellationToken::new();
+    state.register_run(
+        spec.run_id.clone(),
+        RunHandle {
+            worker_addrs: workers.iter().map(|w| w.address.clone()).collect(),
+            cancel: cancel.clone(),
+        },
+    );
+
     // Each worker task sends (worker_id, Partial) into this channel.
     let (partial_tx, partial_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Partial)>();
@@ -206,8 +222,9 @@ pub async fn dispatch_with_ticks(
     }
     drop(partial_tx);
 
-    // Live per-tick aggregator.
-    aggregate_loop(partial_rx, tick_tx, num_workers).await;
+    // Live per-tick aggregator. Stops early if the run's cancel token fires
+    // (abort) instead of waiting for every worker's stream to close.
+    aggregate_loop(partial_rx, tick_tx, num_workers, cancel.clone()).await;
 
     // Final per-tier totals: sum each worker task's own counts (independent of
     // the per-tick aggregation, which may drop ticks if a worker dies mid-run).
@@ -237,6 +254,8 @@ pub async fn dispatch_with_ticks(
             });
         }
     }
+    summary.aborted = cancel.is_cancelled();
+    state.deregister_run(&spec.run_id);
     Ok(summary)
 }
 
@@ -320,12 +339,24 @@ async fn aggregate_loop(
     mut partial_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Partial)>,
     tick_tx: Option<UnboundedSender<AggregatedTick>>,
     num_workers: usize,
+    cancel: CancellationToken,
 ) {
     let mut per_tick: HashMap<u64, HashMap<String, Partial>> = HashMap::new();
     let mut cum_completed = 0u64;
     let mut cum_pass = 0u64;
     let mut cum_fail_status = 0u64;
-    while let Some((worker_id, p)) = partial_rx.recv().await {
+    loop {
+        let (worker_id, p) = tokio::select! {
+            biased;
+            // Abort: stop aggregating immediately. The run finalizes with
+            // whatever totals we accrued; workers are told to drain via the
+            // fan-out Abort gRPC.
+            _ = cancel.cancelled() => break,
+            msg = partial_rx.recv() => match msg {
+                Some(m) => m,
+                None => break,
+            },
+        };
         if p.r#final {
             continue;
         }
