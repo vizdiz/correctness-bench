@@ -73,7 +73,8 @@
                 segmented control; rounded-full for status pills.
     Card/panel  px-5 py-4 (header + body share it).
     Control     px-3 py-1.5 · text-sm   (buttons, nav items, theme toggle).
-    Segmented   container p-0.5; item px-2.5 py-1.
+    Segmented   container p-0.5 text-sm; item px-2.5 py-1.5 (matches field height
+                so a filter + search input in one toolbar line up).
     Field       px-3 py-2 · text-sm.
     Pill/badge  px-2 py-0.5 · text-xs.
     Table cell  px-5 py-3 (px-3 for the checkbox column).

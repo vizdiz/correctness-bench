@@ -7,7 +7,7 @@ import { Field, Input } from '../components/ui/Input'
 import { shortTime } from '../lib/format'
 
 /**
- * /templates — saved re-runnable run specs. Lists each row with target +
+ * /templates - saved re-runnable run specs. Lists each row with target +
  * load shape. The "Run" button opens an inline panel for re-supplying secrets
  * (the "***" placeholder values), then POSTs to /v1/templates/:id/run and
  * navigates to the new run.
@@ -42,7 +42,7 @@ export function Templates() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Templates</h1>
           <p className="mt-1 text-xs text-text-faint">
-            Saved run specs. Secrets in target headers are stored as <code>"***"</code> —
+            Saved run specs. Secrets in target headers are stored as <code>"***"</code>;
             re-supply on Run.
           </p>
         </div>

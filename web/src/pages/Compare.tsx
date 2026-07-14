@@ -51,7 +51,7 @@ export function Compare() {
   if (error) {
     return (
       <Card className="border-danger/40 bg-danger/5 px-5 py-4 text-sm text-danger">
-        {error} — <Link to="/runs" className="underline">back to runs</Link>
+        {error} - <Link to="/runs" className="underline">back to runs</Link>
       </Card>
     )
   }
@@ -72,7 +72,7 @@ export function Compare() {
 
       {unfair && (
         <Card className="mb-6 border-warn/40 bg-warn/5 px-5 py-3 text-sm text-warn">
-          Fairness flagged — {!f.same_load_shape && 'load shapes differ (target_rps / duration_s)'}
+          Fairness flagged - {!f.same_load_shape && 'load shapes differ (target_rps / duration_s)'}
           {!f.same_load_shape && !f.same_assert_spec && '; '}
           {!f.same_assert_spec && 'assert specs differ'}. Treat winner_by as advisory.
         </Card>
@@ -163,7 +163,7 @@ export function Compare() {
                     <td className="py-2">
                       {winner === 'a' && <Badge tone="correct">A</Badge>}
                       {winner === 'b' && <Badge tone="correct">B</Badge>}
-                      {!winner && <span className="text-text-faint">—</span>}
+                      {!winner && <span className="text-text-faint">-</span>}
                     </td>
                   </tr>
                 )
@@ -197,27 +197,27 @@ function RunCard({ label, view }: { label: 'A' | 'B'; view: RunView }) {
       />
       <CardBody className="grid grid-cols-2 gap-4">
         <NumberDisplay label="Target RPS" value={int(view.target_rps)} tone="accent" />
-        <NumberDisplay label="Duration" value={view.duration_s != null ? String(view.duration_s) : '—'} unit="s" tone="accent" />
+        <NumberDisplay label="Duration" value={view.duration_s != null ? String(view.duration_s) : '-'} unit="s" tone="accent" />
         <NumberDisplay
           label="Correctness"
-          value={view.final ? round(view.final.correctness_pct) + '%' : '—'}
+          value={view.final ? round(view.final.correctness_pct) + '%' : '-'}
           tone={view.final && view.final.correctness_pct < 95 ? 'danger' : 'correct'}
         />
         <NumberDisplay
           label="p99"
-          value={view.final ? usToMs(view.final.corrected.p99_us) : '—'}
+          value={view.final ? usToMs(view.final.corrected.p99_us) : '-'}
           unit="ms"
           tone="accent"
         />
         <NumberDisplay
           label="p50"
-          value={view.final ? usToMs(view.final.corrected.p50_us) : '—'}
+          value={view.final ? usToMs(view.final.corrected.p50_us) : '-'}
           unit="ms"
           tone="accent"
         />
         <NumberDisplay
           label="Requests"
-          value={view.final ? int(view.final.total_requests) : '—'}
+          value={view.final ? int(view.final.total_requests) : '-'}
           tone="accent"
         />
       </CardBody>
@@ -226,21 +226,21 @@ function RunCard({ label, view }: { label: 'A' | 'B'; view: RunView }) {
 }
 
 function axisValue(axis: Axis, view: RunView): string {
-  if (!view.final) return '—'
+  if (!view.final) return '-'
   switch (axis) {
     case 'latency_p99':
       return usToMs(view.final.corrected.p99_us) + ' ms'
     case 'correctness':
       return round(view.final.correctness_pct) + '%'
     case 'cost_per_request':
-      if (view.cost_per_request_usd == null) return '—'
+      if (view.cost_per_request_usd == null) return '-'
       return '$' + view.cost_per_request_usd.toFixed(6)
     case 'tail_stability': {
       const spread = view.final.corrected.p99_us - view.final.corrected.p50_us
       return usToMs(spread) + ' ms'
     }
     case 'rate_limit_onset':
-      return view.final.cliff_rps != null ? round(view.final.cliff_rps) + ' RPS' : '—'
+      return view.final.cliff_rps != null ? round(view.final.cliff_rps) + ' RPS' : '-'
   }
 }
 

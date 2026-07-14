@@ -67,7 +67,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
         className="flex items-center justify-center rounded-[var(--radius)] border border-border bg-surface-2/30 text-xs text-text-faint"
         style={{ width: W, height: H }}
       >
-        No results to plot yet — this chart fills in as the run streams.
+        No results to plot yet. This chart fills in as the run streams.
       </div>
     )
   }

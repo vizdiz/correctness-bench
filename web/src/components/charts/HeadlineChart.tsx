@@ -7,8 +7,8 @@ import type { Tick } from '../../lib/api'
  * one data point, bucketed onto its `buckets[0].rps_lo`. If the same bucket
  * appears in multiple ticks, correctness counts sum; latency is the latest.
  *
- * The shape this draws — the GREEN line dropping while the BLUE line stays
- * flat — IS the product's pitch.
+ * The shape this draws - the GREEN line dropping while the BLUE line stays
+ * flat - IS the product's pitch.
  */
 export function HeadlineChart({ ticks }: { ticks: Tick[] }) {
   const view = useMemo(() => buildView(ticks), [ticks])
@@ -87,7 +87,7 @@ function ChartSVG({ view }: { view: ViewModel }) {
         className="flex items-center justify-center rounded-[var(--radius)] border border-border bg-surface-2/30 text-xs text-text-faint"
         style={{ width: W, height: H }}
       >
-        No results to plot yet — this chart fills in as the run streams.
+        No results to plot yet. This chart fills in as the run streams.
       </div>
     )
   }
@@ -180,9 +180,9 @@ function ChartSVG({ view }: { view: ViewModel }) {
           {l.label}
         </text>
       ))}
-      {/* Latency line (blue) — drawn under the correctness line. */}
+      {/* Latency line (blue) - drawn under the correctness line. */}
       <path d={latencyPath} fill="none" stroke="var(--color-latency)" strokeWidth={2} opacity={0.85} />
-      {/* Correctness line (green) — the headline. */}
+      {/* Correctness line (green) - the headline. */}
       <path
         d={correctnessPath}
         fill="none"

@@ -46,7 +46,7 @@ export function RunDetail() {
         })
       })
       .catch(() => {
-        /* history is best-effort — live SSE still works */
+        /* history is best-effort - live SSE still works */
       })
   }, [id])
 
@@ -91,7 +91,7 @@ export function RunDetail() {
   if (error) {
     return (
       <Card className="border-danger/40 bg-danger/5 px-5 py-4 text-sm text-danger">
-        {error} — <Link to="/runs" className="underline">back to runs</Link>
+        {error} - <Link to="/runs" className="underline">back to runs</Link>
       </Card>
     )
   }
@@ -139,30 +139,30 @@ export function RunDetail() {
         )}
       </header>
 
-      {/* Stat strip — live values when SSE is delivering ticks. Latency is the
+      {/* Stat strip - live values when SSE is delivering ticks. Latency is the
           flat axis of the headline; pass rate is the cliff. */}
       <Card className="mb-6">
         <CardBody className="grid grid-cols-2 gap-6 sm:grid-cols-5">
           <NumberDisplay label="Target RPS" value={int(run.target_rps)} tone="accent" />
           <NumberDisplay
             label="Achieved RPS"
-            value={latest ? round(latest.achieved_rps_1s) : '—'}
+            value={latest ? round(latest.achieved_rps_1s) : '-'}
             tone="accent"
           />
           <NumberDisplay
             label="Pass rate"
-            value={passRate != null ? round(passRate) + '%' : '—'}
+            value={passRate != null ? round(passRate) + '%' : '-'}
             tone={passRate != null && passRate < 95 ? 'danger' : 'correct'}
           />
           <NumberDisplay
             label="Latency p50"
-            value={latest ? usToMs(latest.percentiles_so_far.p50_us) : '—'}
+            value={latest ? usToMs(latest.percentiles_so_far.p50_us) : '-'}
             unit="ms"
             tone="accent"
           />
           <NumberDisplay
             label="Latency p99"
-            value={latest ? usToMs(latest.percentiles_so_far.p99_us) : '—'}
+            value={latest ? usToMs(latest.percentiles_so_far.p99_us) : '-'}
             unit="ms"
             tone="accent"
           />
@@ -183,10 +183,10 @@ export function RunDetail() {
           subtitle={
             ticks.length > 0
               ? `${ticks.length} data point(s) · ${latest?.pass_total} passed · ${latest?.fail_status_total} wrong-status`
-              : 'No results yet — this updates live as the run streams.'
+              : 'No results yet. This updates live as the run streams.'
           }
           actions={
-            <div className="inline-flex rounded-[var(--radius)] border border-border bg-surface-2/30 p-0.5 text-xs">
+            <div className="inline-flex rounded-[var(--radius)] border border-border bg-surface-2/30 p-0.5 text-sm">
               {(
                 [
                   ['headline', 'Cliff'],
@@ -197,7 +197,7 @@ export function RunDetail() {
                 <button
                   key={k}
                   onClick={() => setChartTab(k)}
-                  className={`rounded-[calc(var(--radius)-2px)] px-2.5 py-1 transition-colors ${
+                  className={`rounded-[calc(var(--radius)-2px)] px-2.5 py-1.5 transition-colors ${
                     chartTab === k
                       ? 'bg-accent/15 text-accent'
                       : 'text-text-faint hover:text-text-muted'

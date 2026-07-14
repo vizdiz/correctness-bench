@@ -51,7 +51,7 @@ export function RunNew() {
       <header className="mb-6">
         <h1 className="text-xl font-semibold tracking-tight">New run</h1>
         <p className="mt-1 text-sm text-text-muted">
-          Define the target and load shape. Engine wiring lands next — for now this
+          Define the target and load shape. Engine wiring lands next - for now this
           queues a run through the control plane.
         </p>
       </header>
@@ -61,7 +61,7 @@ export function RunNew() {
         <CardBody>
           <form onSubmit={onSubmit} className="flex flex-col gap-4">
             <Field label="Name" htmlFor="name">
-              <Input id="name" name="name" placeholder="openai vs anthropic — 100rps" />
+              <Input id="name" name="name" placeholder="openai vs anthropic - 100rps" />
             </Field>
 
             <div className="grid grid-cols-[1fr_auto] gap-3">

@@ -11,7 +11,7 @@ const tones: Record<Tone, string> = {
 }
 
 /**
- * A large monospaced metric with a label and optional unit — the building block
+ * A large monospaced metric with a label and optional unit - the building block
  * for the stat strip above the (future) charts. Numbers are always pre-rounded
  * by the caller (see lib/format).
  */
