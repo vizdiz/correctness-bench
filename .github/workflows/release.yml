@@ -1,0 +1,39 @@
+# Publish the `bench` CLI as release binaries. Tag a version (e.g. `git tag
+# v0.1.0 && git push --tags`) and this cross-builds `bench` for linux + macOS
+# and attaches each binary to the GitHub release. The correctness-gate Action
+# downloads `bench-x86_64-unknown-linux-gnu` from the latest release.
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: bench ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build bench
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin bench
+        working-directory: cli
+      - name: stage binary
+        run: cp cli/target/${{ matrix.target }}/release/bench "bench-${{ matrix.target }}"
+      - name: attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bench-${{ matrix.target }}
+          fail_on_unmatched_files: true
