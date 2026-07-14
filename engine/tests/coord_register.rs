@@ -89,3 +89,87 @@ async fn worker_register_grows_the_registry() {
     assert!(inner.reason.contains("contract version"));
 }
 
+/// Re-registering the SAME worker_id (what the worker's periodic re-register
+/// loop does, and what a restarted coordinator relearning the fleet triggers)
+/// must UPSERT the existing entry in place: exactly ONE entry, with the LATEST
+/// address and a refreshed heartbeat — never a duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reregister_same_worker_id_upserts_not_duplicates() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(CoordinatorState::new());
+    let svc = CoordinatorService::new(state.clone());
+
+    let incoming = async_stream::stream! {
+        loop {
+            match listener.accept().await {
+                Ok((sock, _)) => yield Ok::<_, std::io::Error>(sock),
+                Err(_) => continue,
+            }
+        }
+    };
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(BenchServer::new(svc))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let channel = Endpoint::from_shared(format!("http://{}", addr))
+        .expect("build endpoint")
+        .connect()
+        .await
+        .expect("dial coord");
+    let mut client = BenchClient::new(channel);
+
+    // First registration at one address.
+    let ack = client
+        .register(WorkerInfo {
+            worker_id: "worker-x".into(),
+            address: "127.0.0.1:9201".into(),
+            contract_version: CONTRACT_VERSION.into(),
+            max_rps: 1000,
+        })
+        .await
+        .expect("register");
+    assert!(ack.into_inner().accepted);
+    assert_eq!(state.list_workers().await.len(), 1);
+
+    // Small gap so the refreshed heartbeat is observably newer.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let hb_before = {
+        let w = state.list_workers().await;
+        w[0].last_heartbeat
+    };
+
+    // Re-register the SAME id with a DIFFERENT address (e.g. the worker moved,
+    // or the coordinator restarted and is relearning). Must upsert in place.
+    let ack = client
+        .register(WorkerInfo {
+            worker_id: "worker-x".into(),
+            address: "127.0.0.1:9299".into(),
+            contract_version: CONTRACT_VERSION.into(),
+            max_rps: 2000,
+        })
+        .await
+        .expect("re-register");
+    assert!(ack.into_inner().accepted);
+
+    let workers = state.list_workers().await;
+    assert_eq!(
+        workers.len(),
+        1,
+        "re-registering an existing worker_id must NOT create a duplicate"
+    );
+    let w = &workers[0];
+    assert_eq!(w.worker_id, "worker-x");
+    assert_eq!(w.address, "127.0.0.1:9299", "address should be updated in place");
+    assert_eq!(w.max_rps, 2000, "max_rps should be refreshed");
+    assert!(
+        w.last_heartbeat >= hb_before,
+        "last_heartbeat should be refreshed on re-register"
+    );
+}
+

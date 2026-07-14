@@ -333,6 +333,7 @@ func runViewFrom(row *store.RunRow) RunView {
 	if len(row.Warnings) > 0 {
 		v.Warnings = row.Warnings
 	}
+	v.RateLimitOnsetRPS = row.RateLimitOnsetRPS
 	if row.StartedAt != nil {
 		s := row.StartedAt.UTC().Format(time.RFC3339)
 		v.StartedAt = &s

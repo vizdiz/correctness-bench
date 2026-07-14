@@ -83,8 +83,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it wants to assign a slice, so it must be able to reach `address`.
     register_with_coordinator(&cli.coord, &worker_id, &address, cli.max_rps).await?;
 
+    // Keep re-registering in the background so a RESTARTED coordinator (whose
+    // in-memory registry is wiped) re-learns every live worker within ~1 period.
+    // Best-effort: transient failures are logged and ignored; the loop never
+    // exits. `register` on the coordinator is idempotent (upsert by worker_id),
+    // so re-registering an already-known worker just refreshes its entry.
+    spawn_reregister_loop(
+        cli.coord.clone(),
+        worker_id.clone(),
+        address.clone(),
+        cli.max_rps,
+        REREGISTER_INTERVAL,
+    );
+
     // Serve until interrupted.
     serve(cli.listen, worker_id).await
+}
+
+/// How often the worker re-announces itself to the coordinator. A restarted
+/// coordinator re-learns the fleet within this window.
+const REREGISTER_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Spawn a detached task that re-registers with the coordinator every
+/// `interval`, forever. Each attempt is best-effort: on error it logs and keeps
+/// looping (the coordinator may be mid-restart). Idempotent on the coordinator
+/// side, so steady-state this just refreshes the worker's registry entry.
+fn spawn_reregister_loop(
+    coord_url: String,
+    worker_id: String,
+    address: String,
+    max_rps: u32,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately; skip it since we already registered
+        // synchronously before this loop started.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match dial_and_register(&coord_url, &worker_id, &address, max_rps).await {
+                Ok(ack) if ack.accepted => {
+                    tracing::debug!(worker_id = %worker_id, "re-registered with coordinator");
+                }
+                Ok(ack) => {
+                    tracing::warn!(
+                        worker_id = %worker_id,
+                        reason = %ack.reason,
+                        "coordinator rejected re-registration"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        worker_id = %worker_id,
+                        error = %e,
+                        "re-registration attempt failed (coordinator down/restarting?); will retry"
+                    );
+                }
+            }
+        }
+    })
 }
 
 async fn register_with_coordinator(

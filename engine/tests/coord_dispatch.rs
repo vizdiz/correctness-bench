@@ -231,6 +231,87 @@ async fn dispatch_merges_hdr_snapshots_across_workers() {
     );
 }
 
+/// Rate-limit onset propagation through the FULL fleet path:
+/// engine (writes first_429_rps atomic) -> worker_node Partial.rate_limit ->
+/// coordinator dispatch aggregation -> DispatchSummary.rate_limit_onset_rps.
+///
+/// Drives the mock in `ratelimit` mode with a low cliff so every request the
+/// workers offer is above the cliff and 429s. Asserts the aggregated summary's
+/// onset is Some(real offered rps), NOT None. This is the downstream check the
+/// engine-level `tests/rate_limit.rs` cannot cover (it never crosses gRPC).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_carries_rate_limit_onset_across_workers() {
+    let mock_addr = spawn_mock().await;
+    let w1_addr = spawn_worker_node("worker-rl-a").await;
+    let w2_addr = spawn_worker_node("worker-rl-b").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let state = Arc::new(CoordinatorState::new());
+    let now = Instant::now();
+    let mut workers = state.workers.write().await;
+    for (id, addr) in [("worker-rl-a", w1_addr), ("worker-rl-b", w2_addr)] {
+        workers.insert(
+            id.into(),
+            Worker {
+                worker_id: id.into(),
+                address: addr.to_string(),
+                contract_version: CONTRACT_VERSION.into(),
+                max_rps: 0,
+                registered_at: now,
+                last_heartbeat: now,
+            },
+        );
+    }
+    drop(workers);
+
+    // cliff_rps=10 is well below each worker's 100 rps slice, so every offered
+    // request is above the cliff; pct=100 makes them all 429. retry_after is
+    // small (mock sends Retry-After: 1s but the coordinator caps backoff and we
+    // only need the FIRST 429 to record onset).
+    let spec = DispatchSpec {
+        run_id: "test-run-rl-onset".into(),
+        target_url: format!(
+            "http://{mock_addr}/api?mode=ratelimit&cliff_rps=10&pct=100&base_latency_ms=2"
+        ),
+        target_method: "GET".into(),
+        target_rps: 200.0, // 100 rps per worker, both above the 10 rps cliff
+        duration_s: 3,
+        connections: 8,
+        keepalive: true,
+        timeout_ms: 5_000,
+        expected_status: vec![200],
+        max_latency_us: None,
+        min_body_bytes: None,
+        max_body_bytes: None,
+        content_type: None,
+        target_headers: Default::default(),
+        epoch_unix_us: 0,
+    };
+
+    let summary = dispatch(state.clone(), spec).await.expect("dispatch ok");
+
+    assert!(
+        summary.total_rate_limited > 0,
+        "expected some 429s to be counted, got {}",
+        summary.total_rate_limited
+    );
+    // The whole point: onset must NOT be null once 429s are seen.
+    let onset = summary
+        .first_429_rps
+        .expect("first_429_rps must be Some after 429s (was None downstream)");
+    // Each worker offers ~100 rps (200 total / 2), constant schedule, so the
+    // onset the worker records is its own slice's target ~100. min across
+    // workers ~100. Must be a real positive offered rate, never 0.
+    assert!(
+        onset > 0.0,
+        "onset must be the real offered rps at first 429, got {onset}"
+    );
+    assert!(
+        (onset - 100.0).abs() < 5.0,
+        "onset should ~= per-worker offered rps (100), got {onset}"
+    );
+}
+
 /// Gate #3 — fleet merge correctness. Run A: 1 worker at full RPS. Run B: 2
 /// workers at half RPS each. Their merged p50/p95/p99 must agree within ±5%
 /// and total counts within ±2%. Heavy (multiple multi-second runs at high
