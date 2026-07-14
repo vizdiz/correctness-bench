@@ -26,6 +26,7 @@ interface BucketPoint {
   rps_mid: number
   total: number
   pass: number
+  rl: number // rate-limited (429s), excluded from the correctness denominator
   pass_rate: number // 0..1
   p99_us: number // latest in this bucket
 }
@@ -47,10 +48,12 @@ function buildView(ticks: Tick[]): ViewModel {
     if (!b || b.total === 0) continue
     const cur = byBucket.get(b.rps_lo)
     const p99 = t.percentiles_so_far?.p99_us ?? 0
+    const rl = b.rate_limited ?? 0
     if (cur) {
       cur.total += b.total
       cur.pass += b.pass
-      cur.pass_rate = cur.total > 0 ? cur.pass / cur.total : 1
+      cur.rl += rl
+      cur.pass_rate = cur.total - cur.rl > 0 ? cur.pass / (cur.total - cur.rl) : 1
       cur.p99_us = p99 // latest sample wins
     } else {
       byBucket.set(b.rps_lo, {
@@ -59,7 +62,8 @@ function buildView(ticks: Tick[]): ViewModel {
         rps_mid: (b.rps_lo + b.rps_hi) / 2,
         total: b.total,
         pass: b.pass,
-        pass_rate: b.total > 0 ? b.pass / b.total : 1,
+        rl,
+        pass_rate: b.total - rl > 0 ? b.pass / (b.total - rl) : 1,
         p99_us: p99,
       })
     }

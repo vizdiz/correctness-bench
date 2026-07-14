@@ -17,7 +17,7 @@
 //! balloons. Stagger pushed corrected p50 from ~30 ms down to ~23 ms in our
 //! measurements (wrk2 is 22.6 ms).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,63 @@ pub struct RunSpec {
     /// Cap on the captured body length; truncated beyond. `0` = no cap (not
     /// recommended for prod).
     pub max_sampled_body_bytes: u32,
+    /// What to do when the target returns HTTP 429. The 429 is OUR load
+    /// artifact (we out-ran the target's rate limit); it is never folded into
+    /// the API's correctness score. See bench.proto RateLimitPolicy.
+    pub rate_limit_action: RlAction,
+    /// Cap on how long we honor a `Retry-After` before firing again (RL_BACKOFF
+    /// only). Prevents a pathological `Retry-After: 3600` from stalling the run.
+    pub max_backoff_ms: u64,
+    /// When true, surface `first_429_rps` (the offered RPS at the send of the
+    /// first 429 in the run) as a measured property.
+    pub record_onset: bool,
+}
+
+/// Worker-side mirror of bench.proto's `RateLimitAction`. Kept local so the
+/// core worker doesn't depend on the generated proto types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RlAction {
+    /// Keep firing, just count the 429s (you'll wall-bang the limiter).
+    Continue,
+    /// Honor `Retry-After` up to `max_backoff_ms`, then resume. Reduces
+    /// effective RPS — expected and correct.
+    Backoff,
+    /// Stop the run (for cost-sensitive metered APIs).
+    Abort,
+}
+
+impl Default for RlAction {
+    fn default() -> Self {
+        RlAction::Backoff
+    }
+}
+
+/// Per-connection rate-limit config, threaded from the RunSpec into each
+/// connection task. Small and `Copy` so it rides the spawn cheaply.
+#[derive(Debug, Clone, Copy)]
+struct RlConfig {
+    action: RlAction,
+    max_backoff_ms: u64,
+    record_onset: bool,
+    /// Aggregate target RPS for the whole worker — used to compute the
+    /// offered-RPS-at-send for the onset measurement.
+    target_rps: f64,
+    ramp: bool,
+    duration_s: u64,
+}
+
+impl RlConfig {
+    /// Offered RPS the scheduler was aiming for at `elapsed_us` into the run.
+    /// Constant schedules offer `target_rps` throughout; a ramp offers a rate
+    /// that scales linearly from 0 to `target_rps` over the run.
+    fn offered_rps_at(&self, elapsed_us: u64) -> f64 {
+        if self.ramp && self.duration_s > 0 {
+            let frac = (elapsed_us as f64 / (self.duration_s as f64 * 1_000_000.0)).clamp(0.0, 1.0);
+            self.target_rps * frac
+        } else {
+            self.target_rps
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -87,6 +144,21 @@ pub struct RunReport {
     pub fail_latency: u64,
     pub fail_size: u64,
     pub fail_content_type: u64,
+    /// HTTP 429 responses. Counted separately from every fail_* tier and
+    /// EXCLUDED from the correctness denominator: the correctness pass-rate is
+    /// `pass / (completed - rate_limited)`. `completed` still includes these
+    /// (they are real responses that count toward achieved throughput).
+    pub rate_limited: u64,
+    /// Offered RPS at the send of the first 429 in the run. `None` if no 429
+    /// was ever observed. Run-wide, measured at the moment of the first 429.
+    pub first_429_rps: Option<f64>,
+    /// Cumulative wall time spent honoring `Retry-After` backoff (RL_BACKOFF).
+    /// This time is NOT charged as target latency — the schedule origin is
+    /// shifted so the COO correction stays honest.
+    pub backoff_us_total: u64,
+    /// Most recent `Retry-After` value parsed off a 429, in ms. `None` if no
+    /// 429 carried a parseable `Retry-After`.
+    pub last_retry_after_ms: Option<i64>,
     pub conn_errors: u64,
     pub timeouts: u64,
     pub corrected: Summary,
@@ -101,6 +173,8 @@ struct ConnResult {
     fail_latency: u64,
     fail_size: u64,
     fail_content_type: u64,
+    rate_limited: u64,
+    backoff_us_total: u64,
     conn_errors: u64,
     timeouts: u64,
 }
@@ -117,6 +191,10 @@ enum Verdict {
     FailLatency,
     FailSize,
     FailContentType,
+    /// HTTP 429. Neither pass nor fail — OUR load artifact. Takes priority over
+    /// every other tier (checked first) so a 429 is never miscounted as
+    /// fail_status, and is excluded from the correctness tally entirely.
+    RateLimited,
 }
 
 /// Inline assertion bundle — pre-built once per run from the RunSpec fields.
@@ -153,7 +231,14 @@ impl InlineAssert {
         content_length: u64,
         content_type_lc: Option<&str>,
     ) -> Verdict {
-        // Status tier first — any non-matching status is fail_status regardless
+        // Rate-limit tier FIRST — a 429 is our own load artifact, never a
+        // correctness failure. It short-circuits every other tier (including a
+        // caller who unwisely listed 429 in expected_status): the thesis is
+        // that 429 is never folded into the API's correctness score.
+        if status == 429 {
+            return Verdict::RateLimited;
+        }
+        // Status tier next — any non-matching status is fail_status regardless
         // of body shape (a 500 with the right content-type is still fail_status).
         let status_ok = if self.expected_status.is_empty() {
             (200..300).contains(&status)
@@ -194,7 +279,6 @@ impl InlineAssert {
 /// Updated on every completed request with Relaxed ordering (we tolerate the
 /// occasional out-of-order observation — exact counts are recomputed at the
 /// end of the run from each task's local `ConnResult`).
-#[derive(Default)]
 struct LiveCounters {
     completed: AtomicU64,
     pass: AtomicU64,
@@ -202,9 +286,68 @@ struct LiveCounters {
     fail_latency: AtomicU64,
     fail_size: AtomicU64,
     fail_content_type: AtomicU64,
+    /// HTTP 429 count — tracked separately from every fail_* tier and outside
+    /// the correctness denominator.
+    rate_limited: AtomicU64,
+    /// Onset guard: `false` until the first 429 is observed run-wide. CAS'd to
+    /// `true` by the connection task that sees the first 429.
+    first_429_seen: AtomicBool,
+    /// f64 bits of the offered RPS at the send of the first 429. Sentinel
+    /// `u64::MAX` means "unset". Written once, under the `first_429_seen` CAS.
+    first_429_rps_bits: AtomicU64,
+    /// Cumulative Retry-After backoff wall time (µs), summed across connections.
+    backoff_us_total: AtomicU64,
+    /// Last parsed Retry-After (ms). Sentinel `i64::MIN` means "none yet".
+    last_retry_after_ms: AtomicI64,
+    /// Run-wide abort flag (RL_ABORT). Once set, every connection task drains
+    /// its current iteration and stops.
+    abort: AtomicBool,
     /// Dedicated counter for the sampling-decision modulus so it stays
     /// independent of bookkeeping atomics.
     sample_seq: AtomicU64,
+}
+
+impl Default for LiveCounters {
+    fn default() -> Self {
+        Self {
+            completed: AtomicU64::new(0),
+            pass: AtomicU64::new(0),
+            fail_status: AtomicU64::new(0),
+            fail_latency: AtomicU64::new(0),
+            fail_size: AtomicU64::new(0),
+            fail_content_type: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            first_429_seen: AtomicBool::new(false),
+            // Sentinel: "no first-429 offered-rps recorded yet".
+            first_429_rps_bits: AtomicU64::new(u64::MAX),
+            backoff_us_total: AtomicU64::new(0),
+            // Sentinel: "no Retry-After parsed yet".
+            last_retry_after_ms: AtomicI64::new(i64::MIN),
+            abort: AtomicBool::new(false),
+            sample_seq: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Load the `first_429_rps` from its atomic bit-store, returning `None` when
+/// unset (sentinel `u64::MAX`).
+fn load_first_429_rps(counters: &LiveCounters) -> Option<f64> {
+    let bits = counters.first_429_rps_bits.load(Ordering::Relaxed);
+    if bits == u64::MAX {
+        None
+    } else {
+        Some(f64::from_bits(bits))
+    }
+}
+
+/// Load the last Retry-After (ms), returning `None` for the `i64::MIN` sentinel.
+fn load_last_retry_after_ms(counters: &LiveCounters) -> Option<i64> {
+    let v = counters.last_retry_after_ms.load(Ordering::Relaxed);
+    if v == i64::MIN {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// One-second snapshot of the run's progress. Shape is a subset of api.md's
@@ -216,6 +359,15 @@ pub struct Tick {
     pub completed_total: u64,
     pub pass_total: u64,
     pub fail_status_total: u64,
+    /// Cumulative 429 count as of this tick (run-to-date).
+    pub rate_limited_total: u64,
+    /// Offered RPS at the send of the first 429 in the run. `null` until a 429
+    /// is seen. Control plane surfaces this as the rate-limit onset.
+    pub rate_limit_onset_rps: Option<f64>,
+    /// Cumulative Retry-After backoff wall time (µs) as of this tick.
+    pub backoff_us_total: u64,
+    /// Last parsed Retry-After (ms); `null` if none seen.
+    pub last_retry_after_ms: Option<i64>,
     /// Counts FOR THIS TICK only — what arrived in the last 1 s. Matches
     /// api.md's `this_tick` nested object. Per-tick pass rate
     /// (`this_tick.pass / this_tick.total`) is the per-second cliff.
@@ -253,6 +405,9 @@ pub struct ThisTick {
     pub fail_latency: u64,
     pub fail_size: u64,
     pub fail_content_type: u64,
+    /// 429s that arrived this tick. Outside the correctness denominator: the
+    /// per-tick pass rate is `pass / (total - rate_limited)`.
+    pub rate_limited: u64,
 }
 
 /// Running-percentile snapshot. api.md SSE tick names this
@@ -277,6 +432,9 @@ pub struct Bucket {
     pub fail_latency: u64,
     pub fail_size: u64,
     pub fail_content_type: u64,
+    /// 429s attributable to this bucket. Excluded from the correctness
+    /// denominator (`total - rate_limited`) so it never triggers a false cliff.
+    pub rate_limited: u64,
 }
 
 /// Bucket width on the offered-RPS axis. 10 RPS matches the api.md example.
@@ -402,11 +560,18 @@ pub async fn run_with_ticks(
         let samples = samples_shared.clone();
         let mut rx = worker_start_rx_template.clone();
         let offset_us = conn_id as u64 * stagger_us;
+        let rate_limit_action = spec.rate_limit_action;
+        let max_backoff_ms = spec.max_backoff_ms;
+        let record_onset = spec.record_onset;
+        let target_rps = spec.target_rps;
+        let ramp = spec.ramp;
+        let duration_s = spec.duration_s;
         joinset.spawn(async move {
             connection_task(
                 host, port, req_bytes, assert_rules, counters, histos, samples,
                 per_conn_schedule, offset_us,
-                spec.duration_s, timeout, barrier, &mut rx,
+                duration_s, timeout, barrier, &mut rx,
+                RlConfig { action: rate_limit_action, max_backoff_ms, record_onset, target_rps, ramp, duration_s },
             )
             .await
         });
@@ -430,6 +595,7 @@ pub async fn run_with_ticks(
             let mut prev_fail_latency = 0u64;
             let mut prev_fail_size = 0u64;
             let mut prev_fail_content_type = 0u64;
+            let mut prev_rate_limited = 0u64;
             for elapsed_s in 1..=duration_s {
                 tokio::time::sleep_until(
                     tokio::time::Instant::from_std(worker_start + Duration::from_secs(elapsed_s)),
@@ -441,6 +607,7 @@ pub async fn run_with_ticks(
                 let fl = counters.fail_latency.load(Ordering::Relaxed);
                 let fz = counters.fail_size.load(Ordering::Relaxed);
                 let fct = counters.fail_content_type.load(Ordering::Relaxed);
+                let rl = counters.rate_limited.load(Ordering::Relaxed);
                 let this_tick = ThisTick {
                     total: c.saturating_sub(prev_completed),
                     pass: p.saturating_sub(prev_pass),
@@ -448,6 +615,7 @@ pub async fn run_with_ticks(
                     fail_latency: fl.saturating_sub(prev_fail_latency),
                     fail_size: fz.saturating_sub(prev_fail_size),
                     fail_content_type: fct.saturating_sub(prev_fail_content_type),
+                    rate_limited: rl.saturating_sub(prev_rate_limited),
                 };
                 let achieved_rps_1s = this_tick.total as f64;
                 prev_completed = c;
@@ -456,6 +624,10 @@ pub async fn run_with_ticks(
                 prev_fail_latency = fl;
                 prev_fail_size = fz;
                 prev_fail_content_type = fct;
+                prev_rate_limited = rl;
+                let rate_limit_onset_rps = load_first_429_rps(&counters);
+                let backoff_us_total = counters.backoff_us_total.load(Ordering::Relaxed);
+                let last_retry_after_ms = load_last_retry_after_ms(&counters);
 
                 // Snapshot percentiles + a V2-deflate copy of the corrected
                 // histogram under the lock. Percentile reads are O(buckets) and
@@ -486,6 +658,7 @@ pub async fn run_with_ticks(
                     fail_latency: this_tick.fail_latency,
                     fail_size: this_tick.fail_size,
                     fail_content_type: this_tick.fail_content_type,
+                    rate_limited: this_tick.rate_limited,
                 };
 
                 // Drain sampled responses captured this tick.
@@ -498,6 +671,10 @@ pub async fn run_with_ticks(
                         completed_total: c,
                         pass_total: p,
                         fail_status_total: fs,
+                        rate_limited_total: rl,
+                        rate_limit_onset_rps,
+                        backoff_us_total,
+                        last_retry_after_ms,
                         this_tick,
                         percentiles_so_far,
                         buckets: vec![bucket],
@@ -521,6 +698,8 @@ pub async fn run_with_ticks(
     let mut total_fail_latency = 0u64;
     let mut total_fail_size = 0u64;
     let mut total_fail_content_type = 0u64;
+    let mut total_rate_limited = 0u64;
+    let mut total_backoff_us = 0u64;
     while let Some(joined) = joinset.join_next().await {
         let res = joined.context("connection task panicked")?;
         conn_errors += res.conn_errors;
@@ -531,6 +710,8 @@ pub async fn run_with_ticks(
         total_fail_latency += res.fail_latency;
         total_fail_size += res.fail_size;
         total_fail_content_type += res.fail_content_type;
+        total_rate_limited += res.rate_limited;
+        total_backoff_us += res.backoff_us_total;
     }
 
     if let Some(h) = tick_handle {
@@ -555,6 +736,10 @@ pub async fn run_with_ticks(
         fail_latency: total_fail_latency,
         fail_size: total_fail_size,
         fail_content_type: total_fail_content_type,
+        rate_limited: total_rate_limited,
+        first_429_rps: load_first_429_rps(&counters),
+        backoff_us_total: total_backoff_us,
+        last_retry_after_ms: load_last_retry_after_ms(&counters),
         conn_errors,
         timeouts,
         corrected,
@@ -577,6 +762,7 @@ async fn connection_task(
     timeout: Duration,
     barrier: Arc<Barrier>,
     worker_start_rx: &mut tokio::sync::watch::Receiver<Option<Instant>>,
+    rl: RlConfig,
 ) -> ConnResult {
     let mut res = ConnResult::default();
 
@@ -614,6 +800,11 @@ async fn connection_task(
     let mut buf_len = 0usize;
 
     loop {
+        // RL_ABORT: another connection (or this one) saw a 429 and the policy
+        // is to stop the whole run. Drain out immediately.
+        if counters.abort.load(Ordering::Relaxed) {
+            break;
+        }
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -724,6 +915,63 @@ async fn connection_task(
                 res.fail_content_type += 1;
                 counters.fail_content_type.fetch_add(1, Ordering::Relaxed);
             }
+            Verdict::RateLimited => {
+                res.rate_limited += 1;
+                counters.rate_limited.fetch_add(1, Ordering::Relaxed);
+
+                // Onset: record the offered RPS at THIS send, run-wide, exactly
+                // once. CAS the guard so only the first observer writes.
+                if rl.record_onset
+                    && counters
+                        .first_429_seen
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    let offered = rl.offered_rps_at(intended_us);
+                    counters
+                        .first_429_rps_bits
+                        .store(offered.to_bits(), Ordering::Relaxed);
+                }
+
+                // Policy.
+                match rl.action {
+                    RlAction::Continue => { /* counted; keep firing */ }
+                    RlAction::Abort => {
+                        // Stop the whole run — every connection drains at the
+                        // top of its loop.
+                        counters.abort.store(true, Ordering::Relaxed);
+                    }
+                    RlAction::Backoff => {
+                        if let Some(ra_ms) = parsed.retry_after_ms {
+                            counters
+                                .last_retry_after_ms
+                                .store(ra_ms as i64, Ordering::Relaxed);
+                            // Honor Retry-After, capped at max_backoff_ms.
+                            let backoff_ms = ra_ms.min(rl.max_backoff_ms);
+                            if backoff_ms > 0 {
+                                let backoff_us = backoff_ms.saturating_mul(1000);
+                                res.backoff_us_total += backoff_us;
+                                counters
+                                    .backoff_us_total
+                                    .fetch_add(backoff_us, Ordering::Relaxed);
+                                // Sleep, then SHIFT the schedule origin forward
+                                // by the backoff so the requests we deferred are
+                                // NOT charged our voluntary wait as target
+                                // latency. This keeps the COO correction honest:
+                                // the backoff behaves like a schedule pause, not
+                                // like the target being slow. (Effective RPS
+                                // drops by the deferred slots — correct.)
+                                if !counters.abort.load(Ordering::Relaxed)
+                                    && Instant::now() < deadline
+                                {
+                                    tokio::time::sleep(Duration::from_micros(backoff_us)).await;
+                                }
+                                sched.defer_origin(backoff_us);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let msg_len = parsed.msg_len;
@@ -750,6 +998,9 @@ struct ParsedResponse {
     /// Content-Type header value, lowercased (None if absent). Owned because
     /// the response buffer is reused for the next request.
     content_type_lc: Option<String>,
+    /// Parsed `Retry-After` in ms (delta-seconds form only). `None` if absent
+    /// or in HTTP-date form (see `parse_retry_after_ms`).
+    retry_after_ms: Option<u64>,
 }
 
 enum ReadResult {
@@ -779,6 +1030,7 @@ async fn read_one_response(
                 Ok(httparse::Status::Complete(hdr_end)) => {
                     let mut cl: u64 = 0;
                     let mut content_type_lc: Option<String> = None;
+                    let mut retry_after_ms: Option<u64> = None;
                     for h in resp.headers.iter() {
                         if h.name.eq_ignore_ascii_case("content-length") {
                             if let Ok(s) = std::str::from_utf8(h.value) {
@@ -787,6 +1039,10 @@ async fn read_one_response(
                         } else if h.name.eq_ignore_ascii_case("content-type") {
                             if let Ok(s) = std::str::from_utf8(h.value) {
                                 content_type_lc = Some(s.trim().to_ascii_lowercase());
+                            }
+                        } else if h.name.eq_ignore_ascii_case("retry-after") {
+                            if let Ok(s) = std::str::from_utf8(h.value) {
+                                retry_after_ms = parse_retry_after_ms(s.trim());
                             }
                         }
                     }
@@ -798,6 +1054,7 @@ async fn read_one_response(
                             status,
                             content_length: cl,
                             content_type_lc,
+                            retry_after_ms,
                         }
                     } else {
                         ParseOutcome::NeedMore
@@ -809,12 +1066,13 @@ async fn read_one_response(
         };
 
         match parse_outcome {
-            ParseOutcome::Complete { msg_len, status, content_length, content_type_lc } => {
+            ParseOutcome::Complete { msg_len, status, content_length, content_type_lc, retry_after_ms } => {
                 return ReadResult::Ok(ParsedResponse {
                     msg_len,
                     status,
                     content_length,
                     content_type_lc,
+                    retry_after_ms,
                 });
             }
             ParseOutcome::Bad => return ReadResult::Err,
@@ -844,7 +1102,17 @@ enum ParseOutcome {
         status: u16,
         content_length: u64,
         content_type_lc: Option<String>,
+        retry_after_ms: Option<u64>,
     },
     NeedMore,
     Bad,
+}
+
+/// Parse a `Retry-After` header value into milliseconds. Only the
+/// delta-seconds form (RFC 9110 §10.2.3, e.g. `Retry-After: 2`) is honored;
+/// the HTTP-date form returns `None` (we treat it as "no machine-usable
+/// backoff" rather than pulling in a date parser on the hot path — a judgment
+/// call; the mock and most APIs emit delta-seconds).
+fn parse_retry_after_ms(v: &str) -> Option<u64> {
+    v.parse::<u64>().ok().map(|secs| secs.saturating_mul(1000))
 }

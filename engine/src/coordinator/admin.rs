@@ -42,6 +42,10 @@ pub struct RunRequest {
     pub timeout_ms: u32,
     #[serde(default)]
     pub expected_status: Vec<i32>,
+    /// Request headers (auth / custom) to send to the target. Carried to the
+    /// worker over bench.proto Target.headers. Never persisted or logged.
+    #[serde(default)]
+    pub target_headers: std::collections::HashMap<String, String>,
     pub max_latency_us: Option<i64>,
     pub min_body_bytes: Option<i32>,
     pub max_body_bytes: Option<i32>,
@@ -72,6 +76,10 @@ pub struct RunResponse {
     pub total_fail_latency: u64,
     pub total_fail_size: u64,
     pub total_fail_content_type: u64,
+    /// 429s across the fleet — OUR load artifact, never in the correctness tally.
+    pub total_rate_limited: u64,
+    /// Offered RPS at which the fleet first saw a 429. `null` if never limited.
+    pub rate_limit_onset_rps: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +148,7 @@ async fn run_endpoint(
         min_body_bytes: req.min_body_bytes,
         max_body_bytes: req.max_body_bytes,
         content_type: req.content_type,
+        target_headers: req.target_headers,
     };
 
     // Live tick aggregator. Always runs; it tracks running totals so we can
@@ -208,6 +217,8 @@ async fn run_endpoint(
                     "status": "completed",
                     "corrected_hist_b64": hist_b64,
                     "uncorrected_hist_b64": uncorrected_b64,
+                    "rate_limited": summary.total_rate_limited as i64,
+                    "rate_limit_onset_rps": summary.first_429_rps,
                 });
                 let http = reqwest::Client::new();
                 let req = http.post(url).json(&body);
@@ -291,5 +302,7 @@ fn to_response(run_id: String, s: DispatchSummary) -> RunResponse {
         total_fail_latency: s.total_fail_latency,
         total_fail_size: s.total_fail_size,
         total_fail_content_type: s.total_fail_content_type,
+        total_rate_limited: s.total_rate_limited,
+        rate_limit_onset_rps: s.first_429_rps,
     }
 }

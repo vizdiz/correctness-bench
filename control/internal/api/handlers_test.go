@@ -16,7 +16,7 @@ import (
 func newHandler(st *store.Store) (http.Handler, *bytes.Buffer) {
 	buf := &bytes.Buffer{}
 	log := slog.New(slog.NewJSONHandler(buf, nil))
-	return NewServer(st, log).Routes(), buf
+	return NewServer(st, log, "", "").Routes(), buf
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {

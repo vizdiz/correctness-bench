@@ -136,6 +136,28 @@ async fn slow_ok_is_slow_but_correct_above_cliff() {
 }
 
 #[tokio::test]
+async fn ratelimit_healthy_below_429_above() {
+    let base = spawn().await;
+
+    let below = reqwest::get(format!("{base}/api?mode=ratelimit&{BELOW}"))
+        .await
+        .unwrap();
+    assert_eq!(below.status(), 200, "below cliff ratelimit should be healthy 200");
+    assert_eq!(below.headers()["x-mock-injected"], "false");
+    assert!(
+        below.headers().get("retry-after").is_none(),
+        "below cliff should not carry Retry-After"
+    );
+
+    let above = reqwest::get(format!("{base}/api?mode=ratelimit&{ABOVE}&pct=100"))
+        .await
+        .unwrap();
+    assert_eq!(above.status(), 429, "above cliff ratelimit should be 429");
+    assert_eq!(above.headers()["x-mock-injected"], "true");
+    assert_eq!(above.headers()["retry-after"], "1");
+}
+
+#[tokio::test]
 async fn pct_50_injects_half_above_cliff() {
     let base = spawn().await;
     let client = reqwest::Client::new();

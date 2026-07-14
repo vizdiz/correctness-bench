@@ -23,10 +23,10 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::proto::bench::bench_server::Bench;
 use crate::proto::bench::worker_event::Kind as WorkerEventKind;
 use crate::proto::bench::{
-    AbortAck, AbortRequest, Assignment, HealthAck, HttpMethod, Partial, RegisterAck, RpsBucket,
-    Started, WorkerEvent, WorkerHealth, WorkerInfo,
+    AbortAck, AbortRequest, Assignment, HealthAck, HttpMethod, Partial, RateLimit, RateLimitAction,
+    RegisterAck, RpsBucket, Started, WorkerEvent, WorkerHealth, WorkerInfo,
 };
-use crate::worker::{run_with_ticks, RunSpec, Tick};
+use crate::worker::{run_with_ticks, RlAction, RunSpec, Tick};
 
 pub struct WorkerNodeService {
     pub worker_id: String,
@@ -149,6 +149,23 @@ fn build_run_spec(a: &Assignment) -> Result<RunSpec, String> {
             (vec![], None, None, None, None)
         };
 
+    // Rate-limit policy. bench.proto's default action (proto3 zero value) is
+    // RL_CONTINUE, but the coordinator sets RL_BACKOFF explicitly; if the
+    // policy is omitted entirely we default to RL_BACKOFF (honor Retry-After),
+    // matching the RunSpec/CLI default and the "the 429 is our artifact" thesis.
+    let (rate_limit_action, max_backoff_ms, record_onset) = match a.rate_limit_policy.as_ref() {
+        Some(p) => {
+            let action = match RateLimitAction::try_from(p.action).unwrap_or(RateLimitAction::RlBackoff) {
+                RateLimitAction::RlContinue => RlAction::Continue,
+                RateLimitAction::RlBackoff => RlAction::Backoff,
+                RateLimitAction::RlAbort => RlAction::Abort,
+            };
+            let max_backoff_ms = if p.max_backoff_ms > 0 { p.max_backoff_ms as u64 } else { 5000 };
+            (action, max_backoff_ms, p.record_onset)
+        }
+        None => (RlAction::Backoff, 5000, true),
+    };
+
     Ok(RunSpec {
         url,
         method,
@@ -165,6 +182,9 @@ fn build_run_spec(a: &Assignment) -> Result<RunSpec, String> {
         ramp: false,
         sample_every_n: 0,
         max_sampled_body_bytes: 0,
+        rate_limit_action,
+        max_backoff_ms,
+        record_onset,
     })
 }
 
@@ -193,7 +213,7 @@ fn partial_from_tick(worker_id: &str, tick_n: u64, is_final: bool, t: &Tick) -> 
             fail_latency: b.fail_latency,
             fail_size: b.fail_size,
             fail_content_type: b.fail_content_type,
-            rate_limited: 0,
+            rate_limited: b.rate_limited,
             timeout: 0,
         })
         .collect();
@@ -213,7 +233,13 @@ fn partial_from_tick(worker_id: &str, tick_n: u64, is_final: bool, t: &Tick) -> 
         in_flight: 0,
         conn_errors: 0,
         timeouts: 0,
-        rate_limit: None,
+        // Rate-limit signal — first-class, never folded into correctness.
+        rate_limit: Some(RateLimit {
+            count_this_tick: t.this_tick.rate_limited,
+            first_429_rps: t.rate_limit_onset_rps,
+            last_retry_after_ms: t.last_retry_after_ms,
+            backoff_us_total: t.backoff_us_total,
+        }),
         bytes_sent: 0,
         bytes_recv: 0,
         sampled: vec![],

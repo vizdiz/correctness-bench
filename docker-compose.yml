@@ -53,6 +53,10 @@ services:
       # libpq-style DSN consumed by pgx.
       DATABASE_URL: "postgres://bench:bench@postgres:5432/bench?sslmode=disable"
       CONTROL_ADDR: ":8000"
+      # Fire the fleet on run creation, and tell the coordinator how to reach us
+      # back for tick/finalize callbacks.
+      COORDINATOR_ADMIN_URL: "http://coordinator:9091"
+      CONTROL_SELF_URL: "http://control:8000"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
       OTEL_SERVICE_NAME: "control"
       OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=local"

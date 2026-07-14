@@ -134,6 +134,22 @@ impl ConnSched {
     pub fn advance(&mut self) {
         self.complete += 1;
     }
+
+    /// Shift the schedule origin forward by `delta_us`. Used when the worker
+    /// deliberately pauses (e.g. honoring a 429 `Retry-After`): pushing
+    /// `thread_start_us` forward moves every future intended-send time forward
+    /// by the same amount, so the deferred requests are NOT charged the
+    /// voluntary wait as (target) latency. This keeps the COO correction honest
+    /// — the backoff behaves like a schedule pause, not like target slowness —
+    /// while naturally reducing effective RPS by the skipped slots.
+    ///
+    /// The catch-up window is re-armed (`caught_up = true`) so we resume at the
+    /// normal rate after the pause instead of blasting a catch-up burst that
+    /// would immediately re-trip the limiter.
+    pub fn defer_origin(&mut self, delta_us: u64) {
+        self.thread_start_us = self.thread_start_us.saturating_add(delta_us);
+        self.caught_up = true;
+    }
 }
 
 // ============================================================

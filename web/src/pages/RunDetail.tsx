@@ -99,11 +99,11 @@ export function RunDetail() {
 
   const canAbort = !terminal.has(run.status)
   const latest = ticks.length > 0 ? ticks[ticks.length - 1] : null
-  // Per-tick pass rate is the headline (this 1 s window, not cumulative).
-  const passRate =
-    latest && latest.this_tick.total > 0
-      ? (latest.this_tick.pass / latest.this_tick.total) * 100
-      : null
+  // Per-tick pass rate is the headline (this 1 s window, not cumulative). 429s
+  // are OUR load artifact, never a correctness failure, so they're excluded
+  // from the denominator.
+  const denom = latest ? latest.this_tick.total - (latest.this_tick.rate_limited ?? 0) : 0
+  const passRate = latest && denom > 0 ? (latest.this_tick.pass / denom) * 100 : null
 
   return (
     <div>
@@ -182,7 +182,10 @@ export function RunDetail() {
           }
           subtitle={
             ticks.length > 0
-              ? `${ticks.length} data point(s) · ${latest?.pass_total} passed · ${latest?.fail_status_total} wrong-status`
+              ? `${ticks.length} data point(s) · ${latest?.pass_total} passed · ${latest?.fail_status_total} wrong-status` +
+                (latest?.rate_limit_onset_rps != null
+                  ? ` · rate-limited from ~${Math.round(latest.rate_limit_onset_rps)} rps`
+                  : '')
               : 'No results yet. This updates live as the run streams.'
           }
           actions={

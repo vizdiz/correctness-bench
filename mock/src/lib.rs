@@ -5,7 +5,7 @@
 //! uniform noise. Everything in the project validates against this.
 //!
 //! Endpoint: `GET|POST /api` with query knobs:
-//!   - `mode`            one of healthy | fast500 | truncate | wrong_value | slow_ok
+//!   - `mode`            one of healthy | fast500 | truncate | wrong_value | slow_ok | ratelimit
 //!   - `cliff_rps`       injection turns on once measured RPS exceeds this
 //!   - `pct`             percentage of above-cliff requests that get the failure
 //!   - `base_latency_ms` fixed latency applied to every response
@@ -42,6 +42,8 @@ pub const WRONG_VALUE_BODY: &str = r#"{"status":"ok","count":-1,"items":["a","b"
 pub const TRUNCATE_BODY: &str = r#"{"status":"ok","count":3,"items":["a","b"#;
 /// Fast error body — a 5xx that returns at normal latency (latency-blind).
 pub const ERROR_BODY: &str = r#"{"status":"error","code":500}"#;
+/// Fast rate-limit body — a 429 that returns at normal latency (latency-blind).
+pub const RATELIMIT_BODY: &str = r#"{"status":"error","code":429}"#;
 
 // ============================================================
 // Rolling 1-second RPS meter
@@ -124,6 +126,7 @@ pub enum Mode {
     Truncate,
     WrongValue,
     SlowOk,
+    Ratelimit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +158,8 @@ pub struct Decision {
     pub body: &'static str,
     /// Total latency to apply (base, plus slow penalty for slow_ok injections).
     pub latency_ms: u64,
+    /// `Retry-After` seconds to attach, if any (ratelimit injections only).
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Decide the response purely from knobs, measured RPS, and the request's
@@ -172,6 +177,7 @@ pub fn decide(p: &Params, rps: f64, seq: u64) -> Decision {
             status: StatusCode::OK,
             body: HEALTHY_BODY,
             latency_ms: p.base_latency_ms,
+            retry_after_secs: None,
         };
     }
 
@@ -183,6 +189,7 @@ pub fn decide(p: &Params, rps: f64, seq: u64) -> Decision {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: ERROR_BODY,
             latency_ms: p.base_latency_ms, // latency-blind: same latency as healthy
+            retry_after_secs: None,
         },
         Mode::Truncate => Decision {
             above_cliff,
@@ -190,6 +197,7 @@ pub fn decide(p: &Params, rps: f64, seq: u64) -> Decision {
             status: StatusCode::OK,
             body: TRUNCATE_BODY,
             latency_ms: p.base_latency_ms,
+            retry_after_secs: None,
         },
         Mode::WrongValue => Decision {
             above_cliff,
@@ -197,6 +205,7 @@ pub fn decide(p: &Params, rps: f64, seq: u64) -> Decision {
             status: StatusCode::OK,
             body: WRONG_VALUE_BODY,
             latency_ms: p.base_latency_ms,
+            retry_after_secs: None,
         },
         Mode::SlowOk => Decision {
             above_cliff,
@@ -204,6 +213,15 @@ pub fn decide(p: &Params, rps: f64, seq: u64) -> Decision {
             status: StatusCode::OK,
             body: HEALTHY_BODY, // correct body, just late
             latency_ms: p.base_latency_ms + SLOW_PENALTY_MS,
+            retry_after_secs: None,
+        },
+        Mode::Ratelimit => Decision {
+            above_cliff,
+            injected: true,
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: RATELIMIT_BODY,
+            latency_ms: p.base_latency_ms, // latency-blind: same latency as healthy
+            retry_after_secs: Some(1),
         },
     }
 }
@@ -266,6 +284,9 @@ async fn handle(State(st): State<Arc<AppState>>, Query(params): Query<Params>) -
     headers.insert("x-mock-rps", HeaderValue::from(rps as u64));
     headers.insert("x-mock-above-cliff", bool_header(d.above_cliff));
     headers.insert("x-mock-injected", bool_header(d.injected));
+    if let Some(secs) = d.retry_after_secs {
+        headers.insert(header::RETRY_AFTER, HeaderValue::from(secs));
+    }
 
     (d.status, headers, d.body).into_response()
 }
@@ -281,6 +302,7 @@ fn mode_header(m: Mode) -> HeaderValue {
         Mode::Truncate => "truncate",
         Mode::WrongValue => "wrong_value",
         Mode::SlowOk => "slow_ok",
+        Mode::Ratelimit => "ratelimit",
     })
 }
 
@@ -326,7 +348,13 @@ mod tests {
     #[test]
     fn below_cliff_always_healthy_even_in_injection_mode() {
         // rps below cliff -> healthy regardless of mode.
-        for mode in [Mode::Fast500, Mode::Truncate, Mode::WrongValue, Mode::SlowOk] {
+        for mode in [
+            Mode::Fast500,
+            Mode::Truncate,
+            Mode::WrongValue,
+            Mode::SlowOk,
+            Mode::Ratelimit,
+        ] {
             let d = decide(&params(mode, 100.0, 100.0), 50.0, 0);
             assert!(!d.injected);
             assert_eq!(d.status, StatusCode::OK);
@@ -350,6 +378,9 @@ mod tests {
         assert_eq!(slow.status, StatusCode::OK);
         assert_eq!(slow.body, HEALTHY_BODY);
         assert_eq!(slow.latency_ms, SLOW_PENALTY_MS);
+        let rl = decide(&params(Mode::Ratelimit, 100.0, 100.0), rps, 0);
+        assert_eq!(rl.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rl.retry_after_secs, Some(1));
     }
 
     #[test]
