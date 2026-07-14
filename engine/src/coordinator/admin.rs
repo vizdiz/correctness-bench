@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -111,6 +111,7 @@ pub fn router(coord: Arc<CoordinatorState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/admin/workers", get(list_workers))
         .route("/admin/runs", post(run_endpoint))
+        .route("/admin/runs/{id}/abort", post(abort_endpoint))
         .with_state(AppState { coord })
 }
 
@@ -122,6 +123,37 @@ async fn list_workers(State(state): State<AppState>) -> impl IntoResponse {
     let workers = state.coord.list_workers().await;
     let views: Vec<WorkerView> = workers.iter().map(WorkerView::from).collect();
     Json(views)
+}
+
+#[derive(Debug, Serialize)]
+struct AbortResponse {
+    run_id: String,
+    aborted: bool,
+}
+
+/// POST /admin/runs/{id}/abort — stop an in-flight run within ~1s. Cancels the
+/// local dispatch aggregation (so the run finalizes as "aborted") and fans an
+/// `Abort` gRPC out to every participating worker off the request path. Returns
+/// 200 immediately without blocking on the run winding down; 404 if the run is
+/// not currently in flight on this coordinator.
+#[tracing::instrument(name = "coordinator.abort_endpoint", level = "info", skip(state))]
+async fn abort_endpoint(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<AbortResponse>, (StatusCode, Json<ErrorBody>)> {
+    if state.coord.abort_run(&run_id) {
+        Ok(Json(AbortResponse {
+            run_id,
+            aborted: true,
+        }))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("run {run_id} is not in flight"),
+            }),
+        ))
+    }
 }
 
 #[tracing::instrument(
@@ -214,7 +246,7 @@ async fn run_endpoint(
                     "total_requests": summary.total_completed as i64,
                     "total_pass":     summary.total_pass as i64,
                     "cliff_rps": finals_snapshot.cliff_rps(),
-                    "status": "completed",
+                    "status": if summary.aborted { "aborted" } else { "completed" },
                     "corrected_hist_b64": hist_b64,
                     "uncorrected_hist_b64": uncorrected_b64,
                     "rate_limited": summary.total_rate_limited as i64,

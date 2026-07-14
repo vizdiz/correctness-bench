@@ -13,12 +13,14 @@ pub mod dispatch;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::proto::bench::bench_client::BenchClient;
 use crate::proto::bench::bench_server::{Bench, BenchServer};
 use crate::proto::bench::{
     AbortAck, AbortRequest, Assignment, HealthAck, RegisterAck, WorkerEvent, WorkerHealth,
@@ -40,9 +42,24 @@ pub struct Worker {
 /// own version; mismatch fails the handshake with a clear reason.
 pub const CONTRACT_VERSION: &str = "1.0.0";
 
+/// A run currently being dispatched by this coordinator. Held in the in-flight
+/// registry so an out-of-band `abort_run` can (a) stop the local aggregation
+/// loop and (b) fan an `Abort` gRPC out to every participating worker.
+#[derive(Clone)]
+pub struct RunHandle {
+    /// gRPC addresses (host:port, no scheme) of the workers running this slice.
+    pub worker_addrs: Vec<String>,
+    /// Cancels the dispatch's aggregation loop so the run finalizes as ABORTED
+    /// instead of waiting out the full duration.
+    pub cancel: CancellationToken,
+}
+
 #[derive(Default)]
 pub struct CoordinatorState {
     pub workers: RwLock<HashMap<String, Worker>>,
+    /// Runs currently in flight, keyed by `run_id`. A `std::sync::Mutex` is
+    /// enough — every critical section is a single map op, no `.await` held.
+    pub runs: Mutex<HashMap<String, RunHandle>>,
 }
 
 impl CoordinatorState {
@@ -52,6 +69,89 @@ impl CoordinatorState {
 
     pub async fn list_workers(&self) -> Vec<Worker> {
         self.workers.read().await.values().cloned().collect()
+    }
+
+    /// Register an in-flight run so it can be aborted. Called at the top of
+    /// `dispatch_with_ticks`.
+    pub fn register_run(&self, run_id: String, handle: RunHandle) {
+        self.runs.lock().unwrap().insert(run_id, handle);
+    }
+
+    /// Deregister a run once its dispatch has wound down. Idempotent.
+    pub fn deregister_run(&self, run_id: &str) {
+        self.runs.lock().unwrap().remove(run_id);
+    }
+
+    /// True if `run_id` is currently in flight on this coordinator.
+    pub fn is_run_active(&self, run_id: &str) -> bool {
+        self.runs.lock().unwrap().contains_key(run_id)
+    }
+
+    /// Abort an in-flight run. Returns `false` if the run isn't known (already
+    /// finished / never dispatched here). On success:
+    ///   (a) cancels the local dispatch token so aggregation stops and the run
+    ///       finalizes as ABORTED, and
+    ///   (b) fires an `Abort` gRPC at every participating worker in parallel
+    ///       (best-effort, short timeout) WITHOUT blocking the caller — the
+    ///       fan-out runs in a detached task so the admin endpoint returns
+    ///       inside the <1s budget.
+    pub fn abort_run(&self, run_id: &str) -> bool {
+        let handle = match self.runs.lock().unwrap().get(run_id) {
+            Some(h) => h.clone(),
+            None => return false,
+        };
+        // (a) Stop local aggregation immediately.
+        handle.cancel.cancel();
+        // (b) Fan Abort out to the workers off the request path.
+        let run_id_owned = run_id.to_string();
+        tokio::spawn(async move {
+            fan_out_aborts(run_id_owned, handle.worker_addrs).await;
+        });
+        true
+    }
+}
+
+/// Dial each worker's `Abort` gRPC in parallel, best-effort, with a short
+/// per-worker timeout. Failures are logged and ignored — the local token cancel
+/// already guarantees the run finalizes as aborted; the gRPC is what makes the
+/// workers stop firing load within ~1s.
+async fn fan_out_aborts(run_id: String, worker_addrs: Vec<String>) {
+    let mut tasks = Vec::new();
+    for addr in worker_addrs {
+        let run_id = run_id.clone();
+        tasks.push(tokio::spawn(async move {
+            let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+                addr.clone()
+            } else {
+                format!("http://{addr}")
+            };
+            let endpoint = match tonic::transport::Endpoint::from_shared(url) {
+                Ok(e) => e.connect_timeout(Duration::from_millis(500)),
+                Err(_) => return,
+            };
+            let channel = match tokio::time::timeout(Duration::from_millis(500), endpoint.connect())
+                .await
+            {
+                Ok(Ok(c)) => c,
+                _ => {
+                    eprintln!("coordinator: abort dial failed for {addr}");
+                    return;
+                }
+            };
+            let mut client = BenchClient::new(channel);
+            let req = tonic::Request::new(AbortRequest {
+                run_id: run_id.clone(),
+                worker_id: String::new(), // empty = this run on that worker
+                reason: "operator abort".to_string(),
+            });
+            match tokio::time::timeout(Duration::from_millis(500), client.abort(req)).await {
+                Ok(Ok(_)) => {}
+                _ => eprintln!("coordinator: abort rpc failed for {addr}"),
+            }
+        }));
+    }
+    for t in tasks {
+        let _ = t.await;
     }
 }
 

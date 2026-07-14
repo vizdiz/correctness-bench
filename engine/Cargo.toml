@@ -25,6 +25,9 @@ path = "src/bin/worker.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "signal", "sync", "io-util"] }
+# Cooperative cancellation for mid-run abort propagation (coordinator -> worker
+# -> run loop). CancellationToken lives in tokio_util::sync.
+tokio-util = { version = "0.7", features = ["rt"] }
 http = "1"
 httparse = "1"
 hdrhistogram = "7"
